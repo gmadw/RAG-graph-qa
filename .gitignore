@@ -1,0 +1,54 @@
+# 临时文件 / 本地缓存 / 虚拟环境
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# 运行时数据（含 SQLite 数据库、用户上传文件、聊天历史、API Key 明文）
+# 必须写成 backend/data/* 才能让下面的 !.gitkeep 生效：
+# 若写成 backend/data/，Git 不会进入该目录，白名单规则会被静默忽略。
+backend/data/*
+!backend/data/.gitkeep
+
+
+# 前端打包产物
+node_modules/
+dist/
+build/
+.vite/
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志 / 临时输出
+*.log
+*.tmp
+*.bak
+*.pid
+
+# 文档库示例文件（可选：若不希望 demo 内容进库，删掉下一行的注释）
+# demo_docs/
+
+# 测试输出
+coverage/
+htmlcov/
+.tox/

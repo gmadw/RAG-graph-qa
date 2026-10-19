@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知识库问答 · RAG + 知识图谱</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- 侧边栏 -->
+  <aside class="sidebar">
+    <div class="logo"><span class="dot"></span>知识库问答<span style="font-size:10px;color:var(--muted);font-weight:400">RAG·Graph</span></div>
+    <nav class="nav" id="nav">
+      <div class="nav-item active" data-view="chat">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        问答
+      </div>
+      <div class="nav-item" data-view="docs">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+        文档库
+      </div>
+      <div class="nav-item" data-view="graph">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="3"/><circle cx="19" cy="6" r="3"/><circle cx="12" cy="19" r="3"/><path d="M7.5 8 10 16M16.5 8 14 16M8 6h8"/></svg>
+        知识图谱
+      </div>
+      <div class="nav-item" data-view="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        模型设置
+      </div>
+    </nav>
+    <div class="chat-list" id="chat-list">
+      <div class="label">历史会话</div>
+    </div>
+  </aside>
+
+  <!-- 主区域 -->
+  <main class="main">
+
+    <!-- 聊天视图 -->
+    <section class="view active" id="view-chat">
+      <div class="chat-toolbar">
+        <button class="small primary" id="btn-new-chat">＋ 新对话</button>
+        <label style="font-size:12px;color:var(--muted)">知识库</label>
+        <select id="chat-kb" title="选择在哪个知识库中提问"></select>
+        <label style="font-size:12px;color:var(--muted)">检索模式</label>
+        <select id="chat-mode">
+          <option value="hybrid">混合（向量+图谱）</option>
+          <option value="vector">向量检索</option>
+          <option value="graph">知识图谱</option>
+          <option value="insights">图谱洞察（社群/中心性）</option>
+          <option value="natural">纯模型问答（不走检索）</option>
+        </select>
+        <button class="small" id="btn-debug" title="查看检索命中详情，不生成回答">检索调试</button>
+        <span class="sub" id="kb-status" style="color:var(--muted);font-size:12px"></span>
+      </div>
+      <div class="chat-messages" id="chat-messages">
+        <div class="msg-wrap" id="msg-wrap">
+          <div class="empty" id="chat-empty">
+            <div class="icon">💬</div>
+            向知识库提问吧<br>
+            <span style="font-size:12px">回答基于已上传文档，带引用来源；可切换向量 / 知识图谱 / 混合检索</span>
+          </div>
+        </div>
+      </div>
+      <div class="chat-input-area">
+        <div class="chat-input-box">
+          <textarea id="chat-input" placeholder="输入问题，Enter 发送（Shift+Enter 换行）" rows="1"></textarea>
+          <button class="primary" id="btn-send" style="height:46px;padding:0 22px">发送</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 文档视图 -->
+    <section class="view" id="view-docs">
+      <div class="view-header">
+        <h2>文档库</h2>
+        <span class="sub" id="docs-sub"></span>
+      </div>
+      <div class="view-body">
+        <div class="kb-bar">
+          <div class="kb-tabs" id="kb-tabs"></div>
+          <div class="kb-actions">
+            <button class="small" id="btn-new-kb" title="新建一个知识库">＋ 新建</button>
+            <button class="small" id="btn-rename-kb" title="重命名当前知识库">✎ 重命名</button>
+            <button class="small danger" id="btn-del-kb" title="删除当前知识库及其全部文档">删除</button>
+          </div>
+        </div>
+        <div class="upload-zone" id="upload-zone">
+          <div class="big">📄 拖拽文件到此处，或点击选择上传</div>
+          <div>上传到当前知识库：<b id="upload-kb-name" style="color:var(--accent)">—</b>。支持 PDF / Word(.docx) / Markdown / TXT / 图片(PNG/JPG)，可多选，上传后自动分块、向量化<span id="upload-graph-tip">、构建知识图谱</span></div>
+          <div style="margin-top:6px;font-size:12px;color:var(--muted)" id="ocr-upload-tip"></div>
+        </div>
+        <input type="file" id="file-input" multiple accept=".pdf,.docx,.md,.markdown,.txt,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff" style="display:none">
+        <table class="docs" id="docs-table">
+          <thead><tr>
+            <th>文件名</th><th>大小</th><th>状态</th><th>分块</th><th>三元组</th><th>向量模型</th><th>操作</th>
+          </tr></thead>
+          <tbody id="docs-tbody"></tbody>
+        </table>
+        <div class="empty" id="docs-empty"><div class="icon">🗂️</div>还没有文档，先上传一份试试</div>
+      </div>
+    </section>
+
+    <!-- 图谱视图 -->
+    <section class="view" id="view-graph">
+      <div class="view-header">
+        <h2>知识图谱</h2>
+        <select id="graph-kb" style="width:auto;padding:5px 8px;font-size:12px" title="选择知识库"></select>
+        <span class="sub">由 LLM 从文档中抽取的实体与关系，随文档构建自动生成</span>
+      </div>
+      <div id="graph-container">
+        <div id="graph-chart"></div>
+        <div class="graph-tools">
+          <input id="graph-search" placeholder="搜索实体，回车过滤子图…">
+          <button class="small" id="graph-refresh">刷新</button>
+        </div>
+        <div class="graph-stats" id="graph-stats"></div>
+        <div class="entity-panel" id="entity-panel">
+          <h4 id="entity-name"></h4>
+          <div class="type" id="entity-type"></div>
+          <div class="entity-desc" id="entity-desc" style="display:none"></div>
+          <div class="entity-aliases" id="entity-aliases" style="display:none"></div>
+          <div id="entity-rels"></div>
+          <div style="margin-top:10px;text-align:right"><button class="small" id="entity-close">关闭</button></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 设置视图 -->
+    <section class="view" id="view-settings">
+      <div class="view-header">
+        <h2>模型设置</h2>
+        <span class="sub">默认预设均为免费渠道；也支持本地 Ollama 与任意 OpenAI 兼容 API</span>
+      </div>
+      <div class="view-body">
+        <div class="settings-wrap" id="settings-wrap">
+          <div class="card">
+            <h3>🧠 对话模型（LLM）</h3>
+            <div class="desc">用于回答生成与知识图谱抽取。只用硅基流动一把 Key 即可：默认 GLM-4-9B-0414（最快最省），也可选 DeepSeek-R1-0528-Qwen3-8B / Qwen3-8B（推理模型，更慢但复杂问题更强）；本地 Ollama 亦可</div>
+            <div class="field-grid">
+              <div class="field"><label>提供商预设</label><select id="llm-provider"></select></div>
+              <div class="field"><label>模型名称</label><input id="llm-model" list="llm-models" placeholder="模型名"><datalist id="llm-models"></datalist></div>
+              <div class="field full"><label>快速填入（<span id="llm-quick-label">当前预设可用模型</span>）</label>
+                <div class="row" id="llm-quick" style="gap:8px;flex-wrap:wrap"></div>
+              </div>
+              <div class="field full"><label>API Base URL（OpenAI 兼容）</label><input id="llm-base-url" placeholder="https://api.siliconflow.cn/v1"></div>
+              <div class="field full"><label>API Key</label>
+                <div class="row"><input id="llm-api-key" type="password" placeholder="sk-…（本地 Ollama 可留空）"><button id="llm-test">测试</button></div>
+                <div class="test-result" id="llm-test-result"></div>
+              </div>
+            </div>
+            <div class="preset-note" id="llm-note"></div>
+          </div>
+
+          <div class="card">
+            <h3>🔢 向量模型（Embedding）</h3>
+            <div class="desc">文档与查询向量化。免费推荐：硅基流动 BAAI/bge-m3 / 本地 Ollama bge-m3</div>
+            <div class="field-grid">
+              <div class="field"><label>提供商预设</label><select id="emb-provider"></select></div>
+              <div class="field"><label>模型名称</label><input id="emb-model" list="emb-models" placeholder="模型名"><datalist id="emb-models"></datalist></div>
+              <div class="field full"><label>API Base URL</label><input id="emb-base-url" placeholder="https://api.siliconflow.cn/v1"></div>
+              <div class="field full"><label>API Key</label>
+                <div class="row"><input id="emb-api-key" type="password" placeholder="sk-…（本地 Ollama 可留空）"><button id="emb-test">测试</button></div>
+                <div class="test-result" id="emb-test-result"></div>
+              </div>
+            </div>
+            <div class="preset-note" id="emb-note"></div>
+          </div>
+
+          <div class="card">
+            <h3>⚖️ 重排序模型（Rerank，可选）</h3>
+            <div class="desc">对检索结果精排，可提升准确率。硅基流动 BAAI/bge-reranker-v2-m3 免费。不启用则跳过</div>
+            <div style="margin-bottom:12px"><label class="switch"><input type="checkbox" id="rr-enabled"> 启用重排序</label></div>
+            <div class="field-grid" id="rr-fields">
+              <div class="field"><label>提供商预设</label><select id="rr-provider"></select></div>
+              <div class="field"><label>模型名称</label><input id="rr-model" list="rr-models" placeholder="模型名"><datalist id="rr-models"></datalist></div>
+              <div class="field full"><label>API Base URL</label><input id="rr-base-url" placeholder="https://api.siliconflow.cn/v1"></div>
+              <div class="field full"><label>API Key</label>
+                <div class="row"><input id="rr-api-key" type="password" placeholder="sk-…"><button id="rr-test">测试</button></div>
+                <div class="test-result" id="rr-test-result"></div>
+              </div>
+            </div>
+            <div class="preset-note" id="rr-note"></div>
+          </div>
+
+          <div class="card">
+            <h3>🔍 文档 OCR（扫描件 / 图片识别）</h3>
+            <div class="desc">扫描件 PDF 与图片没有文字层，需要用视觉模型识别文字。云端可用硅基流动的 PaddleOCR-VL-1.5、DeepSeek-OCR；本地 Ollama 推荐 glm-ocr（智谱 0.9B，识别精度最好）或 richardyoung/unlimited-ocr（百度 3.3B，长文档）。关闭时扫描件会明确提示无法提取文字</div>
+            <div style="margin-bottom:12px"><label class="switch"><input type="checkbox" id="ocr-enabled"> 启用 OCR</label></div>
+            <div class="field-grid" id="ocr-fields">
+              <div class="field"><label>提供商预设</label><select id="ocr-provider"></select></div>
+              <div class="field"><label>模型名称</label><input id="ocr-model" list="ocr-models" placeholder="模型名"><datalist id="ocr-models"></datalist></div>
+              <div class="field full"><label>快速填入（<span id="ocr-quick-label">当前预设可用模型</span>）</label>
+                <div class="row" id="ocr-quick" style="gap:8px;flex-wrap:wrap"></div>
+              </div>
+              <div class="field full"><label>API Base URL（OpenAI 兼容）</label><input id="ocr-base-url" placeholder="https://api.siliconflow.cn/v1"></div>
+              <div class="field full"><label>API Key</label>
+                <div class="row"><input id="ocr-api-key" type="password" placeholder="sk-…（可与对话模型共用同一把 Key）"><button id="ocr-test">测试</button></div>
+                <div class="test-result" id="ocr-test-result"></div>
+              </div>
+              <div class="field"><label>页面渲染 DPI（越高越准、越慢）</label><input id="ocr-dpi" type="number" min="72" max="300" value="150"></div>
+              <div class="field"><label>单份文档最多 OCR 页数</label><input id="ocr-max-pages" type="number" min="1" max="500" value="50"></div>
+            </div>
+            <div class="preset-note" id="ocr-note"></div>
+          </div>
+
+          <div class="card">
+            <h3>⚙️ 检索与图谱参数</h3>
+            <div class="desc"></div>
+            <div class="field-grid">
+              <div class="field"><label>默认检索模式</label>
+                <select id="cfg-mode">
+                  <option value="hybrid">混合（向量+图谱，推荐）</option>
+                  <option value="vector">向量检索</option>
+                  <option value="graph">知识图谱</option>
+                  <option value="insights">图谱洞察（社群/中心性）</option>
+                  <option value="natural">纯模型问答（不走检索）</option>
+                </select>
+              </div>
+              <div class="field"><label>Top K（引用条数）</label><input id="cfg-topk" type="number" min="1" max="20" value="6"></div>
+              <div class="field"><label>图谱扩展跳数</label><input id="cfg-hops" type="number" min="1" max="3" value="2"></div>
+              <div class="field"><label>上传文档时</label>
+                <label class="switch" style="margin-top:6px"><input type="checkbox" id="cfg-build-graph" checked> 自动构建知识图谱</label>
+                <label class="switch" style="margin-top:6px"><input type="checkbox" id="cfg-completion"> 启用图谱补全（LLM 推理隐含关系）</label>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>🧩 知识图谱本体（Ontology）</h3>
+            <div class="desc">自定义实体与关系类型，约束 LLM 抽取口径，让图谱更贴合你的领域（对齐 cognee 的 ontology 能力）。留空则使用内置通用类型。</div>
+            <div style="margin-bottom:12px"><label class="switch"><input type="checkbox" id="onto-enabled"> 启用自定义本体</label></div>
+            <div class="field-grid">
+              <div class="field full"><label>实体类型（换行或逗号分隔）</label>
+                <textarea id="onto-entity-types" rows="3" placeholder="人物&#10;公司&#10;技术&#10;产品"></textarea>
+              </div>
+              <div class="field full"><label>关系类型（换行或逗号分隔）</label>
+                <textarea id="onto-relation-types" rows="3" placeholder="任职于&#10;投资&#10;研发&#10;竞争"></textarea>
+              </div>
+              <div class="field full"><label class="switch"><input type="checkbox" id="onto-filter-search"> 图谱检索时仅匹配上述实体类型</label></div>
+            </div>
+            <div class="preset-note">ℹ️ 修改本体后，对已有文档点「建图谱」可全量重建以应用新类型。</div>
+          </div>
+
+          <div style="display:flex;gap:10px;margin-top:4px">
+            <button class="primary" id="btn-save-settings" style="padding:9px 28px">保存设置</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- 检索调试弹窗 -->
+<div class="debug-modal" id="debug-modal">
+  <div class="debug-box">
+    <h3>🔍 检索调试 <span style="font-weight:400;font-size:12px;color:var(--muted)">（只检索，不生成回答）</span></h3>
+    <div style="display:flex;gap:8px;margin-bottom:14px">
+      <input id="debug-query" placeholder="输入要调试的问题…">
+      <button class="primary" id="debug-run">检索</button>
+      <button id="debug-close">关闭</button>
+    </div>
+    <div id="debug-result"></div>
+  </div>
+</div>
+
+<script src="/static/echarts.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
