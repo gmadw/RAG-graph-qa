@@ -9,7 +9,10 @@ async function api(path, opts = {}) {
   });
   if (!res.ok) {
     let msg = res.statusText;
-    try { const j = await res.json(); msg = j.detail || msg; } catch (e) {}
+    try {
+      const j = await res.json();
+      msg = j.detail || j.error || msg;  // 业务错误（如检索 502 返回 {error}）也要透出真实原因
+    } catch (e) {}
     throw new Error(msg);
   }
   return res.json();
@@ -17,11 +20,15 @@ async function api(path, opts = {}) {
 
 function toast(msg, ok = true) {
   const el = document.createElement("div");
-  el.className = "toast";
-  el.style.borderColor = ok ? "var(--green)" : "var(--red)";
+  el.className = "toast" + (ok ? "" : " err");
+  // 多条通知纵向堆叠，避免互相遮挡
+  el.style.top = 18 + document.querySelectorAll(".toast").length * 48 + "px";
+  el.setAttribute("role", "status");
   el.textContent = msg;
+  el.title = "点击关闭";
+  el.addEventListener("click", () => el.remove());
   document.body.appendChild(el);
-  setTimeout(() => el.remove(), 2600);
+  setTimeout(() => el.remove(), 3200);
 }
 
 function fmtSize(n) {
@@ -168,13 +175,34 @@ $("#nav").addEventListener("click", (e) => {
 /* ================= 聊天 ================= */
 let currentChatId = null;
 let sending = false;
+let sendSeq = 0;          // 流式请求序号：切换会话/新对话后，旧响应自动失效
+let currentAbort = null;  // 当前流式请求的 AbortController
+
+/* 主动中止进行中的流式回答，避免旧回答继续往已切换的会话里写数据 */
+function stopActiveStream() {
+  sendSeq++;
+  if (currentAbort) {
+    currentAbort.abort();
+    currentAbort = null;
+  }
+  sending = false;
+  $("#btn-send").disabled = false;
+}
 
 function newChat() {
+  stopActiveStream();
   currentChatId = null;
   $("#msg-wrap").innerHTML = `
     <div class="empty" id="chat-empty">
-      <div class="icon">💬</div>向知识库提问吧<br>
-      <span style="font-size:12px">当前知识库：<b style="color:var(--accent)">${escapeHtml(kbNameOf(currentKbId))}</b>　回答基于该库已上传文档</span>
+      <div class="eicon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+      <div class="etitle">向知识库提问吧</div>
+      <div class="ehint">当前知识库：<b>${escapeHtml(kbNameOf(currentKbId))}</b> · 回答基于该库已上传文档</div>
+      <div class="sugs">
+        <button class="sug" data-q="这份资料的核心内容是什么？">这份资料的核心内容是什么？</button>
+        <button class="sug" data-q="总结文档里的关键实体和它们的关系">总结关键实体和关系</button>
+        <button class="sug" data-q="用知识图谱梳理一下主要脉络">用知识图谱梳理主要脉络</button>
+        <button class="sug" data-q="文档中提到了哪些流程或方法？">文档中提到哪些流程或方法？</button>
+      </div>
     </div>`;
   loadChatList();
 }
@@ -189,7 +217,14 @@ $("#chat-input").addEventListener("keydown", (e) => {
 $("#btn-send").addEventListener("click", sendQuery);
 
 function escapeHtml(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // 引号也必须转义：知识库名/文件名/错误信息会被拼进 title="..." 这类属性里，
+  // 只转义 &<> 时一个双引号就能闭合属性并注入事件处理器。
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 /* 极简 markdown 渲染 + [n] 引用转上标 */
@@ -211,6 +246,50 @@ function renderMd(text) {
   return t;
 }
 
+/* ===== 模型速率与 token 用量 ===== */
+/* 与后端 providers.estimate_tokens 同口径：CJK ≈1 token/字，其余 ≈1/4 token/字符 */
+function estimateTokens(text) {
+  if (!text) return 0;
+  let cjk = 0;
+  for (const ch of text) if (ch >= "\u3400" && ch <= "\u9fff") cjk++;
+  return Math.max(1, Math.round(cjk + (text.length - cjk) / 4));
+}
+const fmtInt = (n) => (n || 0).toLocaleString("en-US");
+
+/* 流式过程中的实时速率（按字符估算，最终被 stats 事件的精确值替换） */
+function updateLiveUsage(msgEl, acc, firstDeltaAt) {
+  const el = msgEl.querySelector(".usage-line");
+  if (!el) return;
+  const toks = estimateTokens(acc);
+  const secs = Math.max((performance.now() - firstDeltaAt) / 1000, 0.05);
+  el.style.display = "block";
+  el.textContent = `正在生成… 约 ${fmtInt(toks)} tok · ${(toks / secs).toFixed(1)} tok/s（实时估算）`;
+}
+
+function hideUsage(msgEl) {
+  const el = msgEl && msgEl.querySelector(".usage-line");
+  if (el) el.style.display = "none";
+}
+
+function showUsage(msgEl, s) {
+  if (!msgEl || !s) return;
+  const el = msgEl.querySelector(".usage-line");
+  if (!el) return;
+  const parts = [];
+  if (s.model) parts.push("⚡ " + s.model);
+  if (s.ttft_ms != null) parts.push("首字 " + (s.ttft_ms / 1000).toFixed(2) + "s");
+  if (s.tps) parts.push((+s.tps).toFixed(1) + " tok/s");
+  parts.push("↑" + fmtInt(s.prompt_tokens) + " ↓" + fmtInt(s.completion_tokens));
+  const total = s.total_tokens || (s.prompt_tokens || 0) + (s.completion_tokens || 0);
+  let line = parts.join(" · ") + " · 共 " + fmtInt(total) + " tokens";
+  if (s.aux_tokens) line += "（另检索辅助 " + fmtInt(s.aux_tokens) + "）";
+  if (s.estimated) line += " · 估算值";
+  if (s.latency_ms) line += " · 总耗时 " + (s.latency_ms / 1000).toFixed(1) + "s";
+  el.textContent = line;
+  el.title = "↑ 提示 tokens · ↓ 生成 tokens；「估算值」表示模型服务未返回精确用量，按字符数粗略折算";
+  el.style.display = "block";
+}
+
 function appendMsg(role, content = "", refs = null, msgId = null) {
   const empty = $("#chat-empty");
   if (empty) empty.remove();
@@ -223,14 +302,19 @@ function appendMsg(role, content = "", refs = null, msgId = null) {
       <div class="who">${role === "user" ? "你" : "知识库助手"}</div>
       <div class="content"></div>
       <div class="refs-panel" style="display:none"></div>
+      <div class="usage-line" style="display:none"></div>
     </div>`;
   if (role === "bot") {
     wrap.dataset.msgId = msgId || "";
     const bar = document.createElement("div");
     bar.className = "vote-bar";
     bar.innerHTML = `
-      <button class="vote-btn" data-vote="1" title="回答有帮助">👍 有用</button>
-      <button class="vote-btn" data-vote="-1" title="回答有待改进">👎 待改进</button>
+      <button class="vote-btn" data-vote="1" title="回答有帮助">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/></svg>
+        有用</button>
+      <button class="vote-btn" data-vote="-1" title="回答有待改进">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 14V2"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/></svg>
+        待改进</button>
       <span class="vote-done" style="display:none">✓ 已反馈</span>`;
     wrap.querySelector(".bubble").appendChild(bar);
   }
@@ -238,41 +322,54 @@ function appendMsg(role, content = "", refs = null, msgId = null) {
   if (role === "user") contentEl.textContent = content;
   else contentEl.innerHTML = renderMd(content);
   $("#msg-wrap").appendChild(wrap);
-  scrollChat();
+  scrollChat(role === "user");
   return wrap;
 }
 
-function scrollChat() {
+function scrollChat(force = false) {
   const box = $("#chat-messages");
-  box.scrollTop = box.scrollHeight;
+  // 用户上翻阅读历史时不强行拉回底部：仅贴近底部或新消息入列时才滚动
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
+  if (force || nearBottom) box.scrollTop = box.scrollHeight;
 }
 
-function showRefs(msgEl, refs, triples = [], entities = [], searchQuery = null) {
+function showRefs(msgEl, refs, triples = [], entities = [], searchQuery = null, web = null) {
   const panel = msgEl.querySelector(".refs-panel");
-  if (!refs || !refs.length) {
-    if (!triples.length) return;
-  }
+  const webInfo = !!(web && web.enabled);
+  if ((!refs || !refs.length) && !triples.length && !webInfo) return;
   let html = "";
+  if (webInfo) {
+    html += web.error
+      ? `<div class="rp-line rp-web err">联网搜索失败：${escapeHtml(web.error)}（已回退到知识库）</div>`
+      : `<div class="rp-line rp-web">联网搜索：获取 ${web.count || 0} 条网页结果</div>`;
+  }
+  if (webInfo && web.query) {
+    html += `<div class="rp-line">联网检索词：<b>${escapeHtml(web.query)}</b></div>`;
+  }
   if (searchQuery) {
-    html += `<div style="margin-bottom:4px;color:var(--muted)">🔍 检索词（已做多轮指代消解）：<b style="color:var(--accent)">${escapeHtml(searchQuery)}</b></div>`;
+    html += `<div class="rp-line">检索词（已做多轮指代消解）：<b>${escapeHtml(searchQuery)}</b></div>`;
   }
   if (refs && refs.length) {
-    html += `<div style="margin-bottom:4px">📎 引用来源（${refs.length}）</div>`;
+    html += `<div class="rp-title">引用来源（${refs.length}）</div>`;
     html += refs
-      .map(
-        (r) => `<div class="ref-item"><span class="ref-n">${r.n}</span>
-          <div><span class="ref-doc">${escapeHtml(r.doc)}</span>
-          <span style="color:var(--accent);margin-left:6px">${r.score}</span>
-          <div class="ref-text">${escapeHtml(r.text)}</div></div></div>`
-      )
+      .map((r) => {
+        const badge = r.source === "web" ? '<span class="ref-badge">网页</span>' : "";
+        const doc = r.url
+          ? `<a class="ref-doc ref-link" href="${escapeHtml(r.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(r.url)}">${escapeHtml(r.doc)}</a>`
+          : `<span class="ref-doc">${escapeHtml(r.doc)}</span>`;
+        return `<div class="ref-item" data-n="${r.n}"><span class="ref-n">${r.n}</span>
+          <div>${doc}${badge}
+          <span class="ref-score">${r.score}</span>
+          <div class="ref-text">${escapeHtml(r.text)}</div></div></div>`;
+      })
       .join("");
   }
   if (triples && triples.length) {
-    html += `<div class="triples" style="margin-top:6px">🕸️ 图谱三元组（${triples.length}）：<br>` +
+    html += `<div class="triples"><span class="rp-title">图谱三元组（${triples.length}）</span>` +
       triples.map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("") + "</div>";
   }
   if (entities && entities.length) {
-    html += `<div style="margin-top:4px">🎯 命中实体：` + entities.map((e) => `<span class="tag">${escapeHtml(e)}</span>`).join("") + `</div>`;
+    html += `<div class="rp-line" style="margin-top:8px"><span class="rp-title">命中实体</span>` + entities.map((e) => `<span class="tag">${escapeHtml(e)}</span>`).join("") + `</div>`;
   }
   if (html) {
     panel.innerHTML = html;
@@ -291,27 +388,39 @@ async function sendQuery() {
   appendMsg("user", query);
   const botEl = appendMsg("bot", "", null);
   const contentEl = botEl.querySelector(".content");
-  contentEl.innerHTML = '<span class="typing"><span></span><span></span><span></span></span>';
+  contentEl.innerHTML = '<span class="pending-note">正在检索并生成回答…</span>';
 
   let acc = "";
+  let statsData = null;
+  let firstDeltaAt = null;
+  const seq = ++sendSeq;
+  const controller = new AbortController();
+  currentAbort = controller;
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
       body: JSON.stringify({
         chat_id: currentChatId,
         query,
         mode: $("#chat-mode").value,
         kb_id: currentKbId,
+        web: $("#web-search").checked,
       }),
     });
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (!res.ok) {
+      let msg = "HTTP " + res.status;
+      try { const j = await res.json(); if (j && j.detail) msg = j.detail; } catch (e) {}
+      throw new Error(msg);
+    }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (seq !== sendSeq) return;  // 已切到新对话/其他会话，丢弃旧响应
       buf += decoder.decode(value, { stream: true });
       const parts = buf.split("\n\n");
       buf = parts.pop();
@@ -323,13 +432,18 @@ async function sendQuery() {
         let data = {};
         try { data = JSON.parse(dataMatch[1]); } catch (e) {}
         if (ev === "meta") {
-          showRefs(botEl, data.refs, data.graph_triples, data.graph_entities, data.search_query);
+          showRefs(botEl, data.refs, data.graph_triples, data.graph_entities, data.search_query, data.web);
         } else if (ev === "delta") {
+          if (firstDeltaAt === null) firstDeltaAt = performance.now();
           acc += data.text;
           contentEl.innerHTML = renderMd(acc);
+          updateLiveUsage(botEl, acc, firstDeltaAt);
           scrollChat();
+        } else if (ev === "stats") {
+          statsData = data;
+          showUsage(botEl, data);
         } else if (ev === "error") {
-          acc += (acc ? "\n\n⚠️ " : "⚠️ ") + (data.message || "生成失败");
+          acc += (acc ? "\n\n" : "") + "**生成失败：" + (data.message || "请检查模型配置") + "**";
           contentEl.innerHTML = renderMd(acc);
         } else if (ev === "end") {
           if (data.chat_id && data.chat_id !== currentChatId) {
@@ -337,21 +451,52 @@ async function sendQuery() {
             loadChatList();
           }
           if (data.message_id) botEl.dataset.msgId = data.message_id;
+          if (!statsData) hideUsage(botEl);  // 无用量数据（如知识库为空的固定回复）时隐藏行
         }
       }
     }
+    if (seq !== sendSeq) return;
     if (!acc) contentEl.innerHTML = '<span style="color:var(--muted)">（无输出，请检查设置中的模型配置）</span>';
   } catch (e) {
+    if (seq !== sendSeq || e.name === "AbortError") return;  // 用户主动切换导致的取消
+    hideUsage(botEl);
     contentEl.innerHTML = `<span style="color:var(--red)">请求失败：${escapeHtml(e.message)}。请确认模型设置正确。</span>`;
   } finally {
-    sending = false;
-    $("#btn-send").disabled = false;
-    input.focus();
+    if (seq === sendSeq) {
+      sending = false;
+      $("#btn-send").disabled = false;
+      if (currentAbort === controller) currentAbort = null;
+      input.focus();
+    }
   }
 }
 
-/* 历史会话 */
+/* 历史会话 / 建议问题 / 引用跳转（事件委托） */
 $("#msg-wrap").addEventListener("click", async (e) => {
+  // 空态建议问题：点一下即填入输入框
+  const sug = e.target.closest(".sug");
+  if (sug) {
+    const inp = $("#chat-input");
+    inp.value = sug.dataset.q || "";
+    inp.dispatchEvent(new Event("input"));
+    inp.focus();
+    return;
+  }
+  // 引用上标 [n] → 滚动到下方对应来源并高亮
+  const cite = e.target.closest("sup.cite");
+  if (cite) {
+    const n = cite.dataset.n;
+    // 只在当前这条回答的引用面板里找：全局查找会跳到历史消息的同号引用
+    const msgEl = cite.closest(".msg");
+    const ref = msgEl && msgEl.querySelector(`.refs-panel .ref-item[data-n="${n}"]`);
+    if (ref) {
+      ref.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      ref.classList.remove("flash");
+      void ref.offsetWidth; // 重启动画
+      ref.classList.add("flash");
+    }
+    return;
+  }
   const btn = e.target.closest(".vote-btn");
   if (!btn) return;
   const msgEl = btn.closest(".msg");
@@ -390,7 +535,12 @@ async function loadChatList() {
     el.querySelector(".t").addEventListener("click", () => openChat(c.id, c.kb_id));
     el.querySelector(".x").addEventListener("click", async (e) => {
       e.stopPropagation();
-      await api("/api/chats/" + c.id, { method: "DELETE" });
+      try {
+        await api("/api/chats/" + c.id, { method: "DELETE" });
+      } catch (err) {
+        toast(err.message, false);
+        return;
+      }
       if (currentChatId === c.id) $("#btn-new-chat").click();
       else loadChatList();
     });
@@ -399,6 +549,7 @@ async function loadChatList() {
 }
 
 async function openChat(chatId, kbId) {
+  stopActiveStream();  // 切换历史会话时中止仍在进行的回答
   currentChatId = chatId;
   // 会话绑定某个知识库：打开时同步切换当前知识库
   if (kbId != null && kbId !== currentKbId && KBS.some((k) => k.id === kbId)) {
@@ -414,9 +565,10 @@ async function openChat(chatId, kbId) {
   for (const m of msgs) {
     const el = appendMsg(m.role === "user" ? "user" : "bot", m.content, m.refs, m.id);
     if (m.role !== "user" && m.refs && m.refs.length) showRefs(el, m.refs);
+    if (m.role !== "user" && m.stats) showUsage(el, m.stats);  // 历史回答的用量与速率
   }
   loadChatList();
-  scrollChat();
+  scrollChat(true);
 }
 
 /* ================= 文档库 ================= */
@@ -434,19 +586,19 @@ async function loadDocs() {
     if (d.status === "done") done++;
     const tr = document.createElement("tr");
     const statusMap = {
-      done: '<span class="badge done">已完成</span>',
-      processing: `<span class="badge processing">处理中·${escapeHtml(d.stage || "")}</span>`,
-      pending: '<span class="badge pending">等待中</span>',
-      error: `<span class="badge error">失败</span>`,
+      done: '<span class="badge done"><i class="dot"></i>已完成</span>',
+      processing: `<span class="badge processing"><i class="dot"></i>处理中·${escapeHtml(d.stage || "")}</span>`,
+      pending: '<span class="badge pending"><i class="dot"></i>等待中</span>',
+      error: `<span class="badge error"><i class="dot"></i>失败</span>`,
     };
     tr.innerHTML = `
       <td class="doc-name" title="${escapeHtml(d.filename)}">${escapeHtml(d.filename)}</td>
-      <td>${fmtSize(d.size)}</td>
+      <td class="num">${fmtSize(d.size)}</td>
       <td>${statusMap[d.status] || d.status}${d.error ? `<div class="err-tip" title="${escapeHtml(d.error)}">${escapeHtml(d.error)}</div>` : ""}</td>
-      <td>${d.chunk_count || "-"}</td>
-      <td>${d.triple_count || "-"}</td>
+      <td class="num">${d.chunk_count || "-"}</td>
+      <td class="num">${d.triple_count || "-"}</td>
       <td style="font-size:11px;color:var(--muted)">${escapeHtml((d.embed_tag || "").split("::")[1] || "-")}</td>
-      <td style="white-space:nowrap">
+      <td class="actions">
         <button class="small" data-act="reparse" data-id="${d.id}" title="清空分块后重新解析（启用 OCR 后可识别扫描件）">重解析</button>
         <button class="small" data-act="graph" data-id="${d.id}" ${d.status !== "done" ? "disabled" : ""} title="重新用 LLM 抽取实体关系">建图谱</button>
         <button class="small danger" data-act="del" data-id="${d.id}">删除</button>
@@ -469,7 +621,12 @@ function tbodyEvents() {
     const id = btn.dataset.id;
     if (btn.dataset.act === "del") {
       if (!confirm("删除该文档及其全部分块与图谱关系？")) return;
-      await api("/api/documents/" + id, { method: "DELETE" });
+      try {
+        await api("/api/documents/" + id, { method: "DELETE" });
+      } catch (err) {
+        toast(err.message, false);
+        return;
+      }
       loadDocs();
       loadKbs();
     } else if (btn.dataset.act === "reparse") {
@@ -486,8 +643,15 @@ function tbodyEvents() {
     } else if (btn.dataset.act === "graph") {
       btn.disabled = true;
       btn.textContent = "构建中…";
-      await api(`/api/documents/${id}/graph`, { method: "POST" });
-      toast("已开始构建知识图谱（后台运行）");
+      try {
+        await api(`/api/documents/${id}/graph`, { method: "POST" });
+        toast("已开始构建知识图谱（后台运行）");
+      } catch (err) {
+        toast(err.message, false);
+        btn.disabled = false;
+        btn.textContent = "建图谱";
+        return;
+      }
       setTimeout(loadDocs, 800);
     }
   });
@@ -518,8 +682,10 @@ async function handleFiles(files) {
     const j = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(j.detail || "上传失败");
     const skipped = j.skipped || [];
+    const rejected = j.rejected || [];
     let msg = `已上传 ${(j.doc_ids || []).length} 个文件到「${kbNameOf(currentKbId)}」，后台处理中…`;
     if (skipped.length) msg += `；跳过 ${skipped.length} 个重复文档（内容已存在）`;
+    if (rejected.length) msg += `；${rejected.length} 个文件类型不支持`;
     toast(msg);
     loadDocs();
     loadKbs();
@@ -549,25 +715,28 @@ async function refreshGraph(q = "") {
     api("/api/graph/stats" + (currentKbId != null ? "?kb_id=" + currentKbId : "")),
     api("/api/graph?limit=300" + (q ? "&q=" + encodeURIComponent(q) : "") + kbq),
   ]);
-  $("#graph-stats").innerHTML = `${kbNameOf(currentKbId)} · 实体 ${stats.entities} · 关系 ${stats.relations}` + (q ? ` · 筛选"${escapeHtml(q)}"` : "");
+  $("#graph-stats").innerHTML = `${escapeHtml(kbNameOf(currentKbId))} · 实体 ${stats.entities} · 关系 ${stats.relations}` + (q ? ` · 筛选"${escapeHtml(q)}"` : "");
   if (!data.nodes.length) {
     graphChart.clear();
     graphChart.setOption({
-      title: { text: `知识库「${kbNameOf(currentKbId)}」暂无图谱数据：请先在「文档库」上传文档（会自动构建），或点击「建图谱」`, left: "center", top: "middle", textStyle: { color: "#8b949e", fontSize: 13 } },
+      title: { text: `知识库「${kbNameOf(currentKbId)}」暂无图谱数据：请先在「文档库」上传文档（会自动构建），或点击「建图谱」`, left: "center", top: "middle", textStyle: { color: "#8f9bab", fontSize: 13 } },
     });
     return;
   }
   graphChart.setOption(
     {
       tooltip: {
+        backgroundColor: "rgba(16,20,28,.94)",
+        borderColor: "#2e3950",
+        textStyle: { color: "#e3e9f2", fontSize: 12 },
         formatter: (p) => {
           if (p.dataType === "node") {
-            return `${p.name}（度数 ${p.value || 0}）` + (p.data && p.data.desc ? `<br/>📖 ${p.data.desc}` : "");
+            return `${p.name}（度数 ${p.value || 0}）` + (p.data && p.data.desc ? `<br/>${p.data.desc}` : "");
           }
           return `${p.data.source} —${p.data.value || ""}→ ${p.data.target}`;
         },
       },
-      legend: [{ data: data.categories.map((c) => c.name), textStyle: { color: "#8b949e" }, type: "scroll", right: 10, bottom: 10 }],
+      legend: [{ data: data.categories.map((c) => c.name), textStyle: { color: "#8f9bab" }, type: "scroll", right: 10, bottom: 10, pageIconColor: "#8f9bab", pageTextStyle: { color: "#8f9bab" } }],
       series: [
         {
           type: "graph",
@@ -578,14 +747,14 @@ async function refreshGraph(q = "") {
           data: data.nodes,
           links: data.links,
           force: { repulsion: 220, edgeLength: [40, 120], gravity: 0.08, layoutAnimation: true },
-          label: { show: true, position: "right", color: "#e6edf3", fontSize: 11 },
+          label: { show: true, position: "right", color: "#dbe3ef", fontSize: 11 },
           labelLayout: { hideOverlap: true },
-          lineStyle: { color: "source", curveness: 0.15, opacity: 0.6 },
+          lineStyle: { color: "source", curveness: 0.15, opacity: 0.55 },
           emphasis: { focus: "adjacency", lineStyle: { width: 3 } },
-          itemStyle: { borderColor: "#0d1117", borderWidth: 1 },
+          itemStyle: { borderColor: "#0b0e14", borderWidth: 1 },
         },
       ],
-      color: ["#4f8cff", "#22c55e", "#facc15", "#f472b6", "#a78bfa", "#fb923c", "#2dd4bf", "#e879f9"],
+      color: ["#4f8cff", "#3dd68c", "#e7c25f", "#f472b6", "#a78bfa", "#fb923c", "#2dd4bf", "#e879f9"],
     },
     true
   );
@@ -602,14 +771,14 @@ async function openEntity(entityId) {
   $("#entity-type").textContent = `${d.entity.type || "未分类"} · 提及 ${d.entity.mention_count} 次`;
   const descEl = $("#entity-desc");
   if (d.entity.description) {
-    descEl.textContent = "📖 " + d.entity.description;
+    descEl.textContent = d.entity.description;
     descEl.style.display = "block";
   } else {
     descEl.style.display = "none";
   }
   const aliasEl = $("#entity-aliases");
   if (d.aliases && d.aliases.length) {
-    aliasEl.innerHTML = "🔁 别名：" + d.aliases.map((a) => `<span class="tag">${escapeHtml(a)}</span>`).join("");
+    aliasEl.innerHTML = "别名：" + d.aliases.map((a) => `<span class="tag">${escapeHtml(a)}</span>`).join("");
     aliasEl.style.display = "block";
   } else {
     aliasEl.style.display = "none";
@@ -680,7 +849,8 @@ function applyPreset(pfx, providerKey, clearKey = true) {
   if (!p) return;
   // 只在用户主动切换预设时覆盖 Base URL：页面加载时的 applyPreset(..., false)
   // 不能把用户手填的地址（如 Ollama 跑在别的机器上）冲回默认值
-  if (clearKey && p.base_url) $("#" + pfx + "-base-url").value = p.base_url;
+  // 切到「自定义」时预设的 base_url / model 是空串，也要清空，否则会残留上一家的值
+  if (clearKey) $("#" + pfx + "-base-url").value = p.base_url || "";
   const modelField = $("#" + pfx + "-model");
   const listId = (pfx === "rr" ? "rr" : pfx) + "-models";
   const dl = document.getElementById(listId);
@@ -693,7 +863,7 @@ function applyPreset(pfx, providerKey, clearKey = true) {
   const [listKey, defKey] = MF[pfx] || MF.rr;
   dl.innerHTML = (p[listKey] || []).map((m) => `<option value="${m}">`).join("");
   const defModel = p[defKey];
-  if (defModel && clearKey) modelField.value = defModel;
+  if (clearKey) modelField.value = defModel || "";
 
   // 快速填入按钮随预设重建：原来写死硅基流动的模型名，切到 Ollama 就全点错了
   const quickBox = document.getElementById(pfx + "-quick");
@@ -716,9 +886,9 @@ function applyPreset(pfx, providerKey, clearKey = true) {
 
   const note = $("#" + pfx + "-note");
   if (note) {
-    note.innerHTML = "ℹ️ " + (p.note || "");
+    note.innerHTML = p.note || "";
     if (p.key_url) {
-      note.innerHTML += `　<a href="${p.key_url}" target="_blank" style="color:var(--accent)">获取 API Key ↗</a>`;
+      note.innerHTML += `　<a href="${p.key_url}" target="_blank">获取 API Key ↗</a>`;
     }
   }
 }
@@ -735,10 +905,10 @@ async function testConn(pfx, section) {
   await saveSettings(false);
   try {
     const r = await api(`/api/settings/test/${section}`, { method: "POST" });
-    el.textContent = (r.ok ? "✅ " : "❌ ") + r.detail;
+    el.textContent = (r.ok ? "✓ 通过：" : "✗ 失败：") + r.detail;
     el.className = "test-result " + (r.ok ? "ok" : "fail");
   } catch (e) {
-    el.textContent = "❌ " + e.message;
+    el.textContent = "✗ 失败：" + e.message;
     el.className = "test-result fail";
   }
 }
@@ -841,6 +1011,16 @@ $("#debug-run").addEventListener("click", runDebug);
 $("#debug-query").addEventListener("keydown", (e) => {
   if (e.key === "Enter") runDebug();
 });
+/* ESC：关闭最上层的调试弹窗 / 实体面板 */
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const modal = $("#debug-modal");
+  if (modal.classList.contains("show")) {
+    modal.classList.remove("show");
+    return;
+  }
+  $("#entity-panel").classList.remove("show");
+});
 async function runDebug() {
   const q = $("#debug-query").value.trim();
   if (!q) return;
@@ -849,31 +1029,42 @@ async function runDebug() {
   try {
     const r = await api("/api/retrieve-preview", {
       method: "POST",
-      body: JSON.stringify({ query: q, mode: $("#chat-mode").value }),
+      body: JSON.stringify({ query: q, mode: $("#chat-mode").value, kb_id: currentKbId, web: $("#web-search").checked }),
     });
     if (r.error) throw new Error(r.error);
     let html = "";
     if (r.graph_entities && r.graph_entities.length) {
-      html += `<div style="margin-bottom:8px">🎯 命中实体：` + r.graph_entities.map((e) => `<span class="tag">${escapeHtml(e)}</span>`).join("") + `</div>`;
+      html += `<div style="margin-bottom:8px"><span class="rp-title">命中实体</span> ` + r.graph_entities.map((e) => `<span class="tag">${escapeHtml(e)}</span>`).join("") + `</div>`;
     }
     if (r.graph_triples && r.graph_triples.length) {
-      html += `<div style="margin-bottom:10px">🕸️ 图谱路径：<br>` + r.graph_triples.map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("") + `</div>`;
+      html += `<div style="margin-bottom:10px"><span class="rp-title">图谱路径</span><br>` + r.graph_triples.map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("") + `</div>`;
+    }
+    if (r.web && r.web.enabled) {
+      html += r.web.error
+        ? `<div style="color:var(--yellow);margin-bottom:8px">联网搜索失败：${escapeHtml(r.web.error)}</div>`
+        : `<div style="color:var(--muted);margin-bottom:8px">联网搜索：${r.web.count || 0} 条网页结果</div>`;
+      if (r.web.query) {
+        html += `<div style="color:var(--muted);margin-bottom:8px">联网检索词：${escapeHtml(r.web.query)}</div>`;
+      }
     }
     if (r.chunks && r.chunks.length) {
       html += r.chunks
-        .map(
-          (c) => `<div class="debug-chunk">
-            <div class="head"><span>[${c.n}] ${escapeHtml(c.doc)}</span><span class="score">score ${c.score}</span></div>
+        .map((c) => {
+          const doc = c.url
+            ? `<a class="ref-link" href="${escapeHtml(c.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(c.doc)}</a>`
+            : escapeHtml(c.doc);
+          return `<div class="debug-chunk">
+            <div class="head"><span>[${c.n}] ${doc}${c.source === "web" ? ' <span class="ref-badge">网页</span>' : ""}</span><span class="score">score ${c.score}</span></div>
             ${escapeHtml(c.text)}
-          </div>`
-        )
+          </div>`;
+        })
         .join("");
     } else {
-      html += '<div style="color:var(--muted);padding:16px;text-align:center">未命中任何内容</div>';
+      html += '<div class="debug-empty">未命中任何内容</div>';
     }
     box.innerHTML = html;
   } catch (e) {
-    box.innerHTML = `<div style="color:var(--red);padding:16px">${escapeHtml(e.message)}</div>`;
+    box.innerHTML = `<div class="debug-empty" style="color:var(--red)">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -889,6 +1080,13 @@ async function loadKbStatus() {
 }
 
 /* ================= 初始化 ================= */
+/* 联网搜索开关：记住上次状态 */
+const webSearchEl = $("#web-search");
+webSearchEl.checked = localStorage.getItem("web_search") === "1";
+webSearchEl.addEventListener("change", () => {
+  localStorage.setItem("web_search", webSearchEl.checked ? "1" : "0");
+});
+
 $("#chat-input").addEventListener("input", function () {
   this.style.height = "auto";
   this.style.height = Math.min(this.scrollHeight, 160) + "px";

@@ -86,6 +86,8 @@ def fake_answer(messages):
     # 从参考资料里摘取相关句子
     m = re.search(r"【参考资料】\n(.+?)\n\n【用户问题】", user, re.S)
     ctx = m.group(1) if m else ""
+    # 参考资料末尾可能附带「知识图谱三元组」小节，伪回答只摘原文分块
+    ctx = ctx.split("【知识图谱三元组")[0]
     sents = re.split(r"(?<=[。！？\n])", ctx)
     sents = [s.strip().lstrip("[]0123456789 ").strip() for s in sents if len(s.strip()) > 15][:3]
     if sents:
@@ -111,15 +113,26 @@ async def chat_completions(request: Request):
             user = m["content"]
             break
 
-    if "三元组" in user or "知识图谱信息抽取" in user:
-        text = user.split("待抽取文本：")[-1]
+    # 注意：不能只用「三元组」「关键实体」这类词判断请求类型——问答请求的参考资料里
+    # 本身就会出现「知识图谱三元组」「关键实体」等字样，会被误判成抽取/实体链接请求，
+    # 导致用户提问却收到一段 JSON。这里改用各 prompt 独有的模板标记来区分。
+    if "待抽取文本：" in user or "知识图谱信息抽取" in user:
+        text = user.split("待抽取文本：", 1)[-1]
         content = json.dumps(extract_triples_mock(text), ensure_ascii=False)
-    elif "关键实体" in user or "知识图谱检索" in user:
-        text = user.split("用户问题：")[-1]
+    elif "用于知识图谱检索的关键实体或关键词" in user:
+        text = user.split("用户问题：", 1)[-1]
         # 按常见虚词/标点切分后取短语，更接近真实 LLM 的实体链接效果
         parts = [p.strip() for p in re.split(r"[的了吗呢吧，。；、！？\s]", text) if len(p.strip()) >= 2]
         words = list(dict.fromkeys(parts or CN_WORD.findall(text)))[:5] or [text.strip()[:6]]
         content = json.dumps(words, ensure_ascii=False)
+    elif "你是查询改写助手" in user:
+        # 多轮指代消解：原样返回当前问题，避免把伪回答当成改写结果去做检索
+        text = user.split("【当前问题】", 1)[-1].split("改写后的问题：", 1)[0].strip()
+        content = text or user.strip()[:100]
+    elif ("你是实体消解专家" in user or "你是知识图谱构建助手" in user
+          or "你是知识图谱补全专家" in user):
+        # 别名消解 / 实体描述 / 图谱补全：Mock 不产出，返回空数组让流程正常跳过
+        content = "[]"
     else:
         content = fake_answer(messages)
 
@@ -143,6 +156,14 @@ async def chat_completions(request: Request):
             }
             yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
             await asyncio.sleep(0.02)
+        # 末尾补一个仅含 usage 的分块（OpenAI include_usage 风格），供用量统计走「精确值」路径
+        pt, ct = max(1, len(user) // 2), max(1, len(content) // 2)
+        data = {
+            "id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": int(time.time()),
+            "model": model, "choices": [],
+            "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+        }
+        yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")

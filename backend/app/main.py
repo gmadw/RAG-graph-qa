@@ -102,7 +102,8 @@ async def test_conn(section: str):
 
 class KbIn(BaseModel):
     name: str
-    description: str | None = ""
+    # 默认 None：PUT 时前端只传 name，不应把已有描述冲成空串
+    description: str | None = None
 
 
 @app.get("/api/kbs")
@@ -128,6 +129,8 @@ def update_kb(kb_id: int, body: KbIn):
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(400, "知识库名称不能为空")
+    if len(name) > 60:
+        raise HTTPException(400, "知识库名称过长（最多 60 字）")
     db.rename_kb(kb_id, name, body.description)
     return {"ok": True}
 
@@ -152,28 +155,48 @@ async def upload(files: list[UploadFile] = File(...), kb_id: int | None = None,
         kb_id = kbs[0]["id"] if kbs else None
     elif not db.kb_exists(kb_id):
         raise HTTPException(400, "指定的知识库不存在")
-    saved_ids = []
-    skipped = []
+    # 先整体校验文件类型再落盘：避免批量上传里前面的文件已保存、
+    # 后面一个非法文件触发 400 时，已保存的文件卡在 pending 永不处理
+    rejected = []
+    prepared = []
     for f in files:
         # 仅取文件名，剥离任何路径成分，避免 ../ 路径穿越
         safe_name = Path((f.filename or "upload").replace("\\", "/")).name or "upload"
         suffix = Path(safe_name).suffix.lower()
         if suffix not in ALLOWED_SUFFIXES:
-            raise HTTPException(
-                400, f"不支持的文件类型 {suffix}，仅支持 pdf/docx/md/txt 与常见图片格式"
-            )
+            rejected.append(safe_name)
+            continue
+        prepared.append((f, safe_name))
+    if rejected and not prepared:
+        raise HTTPException(
+            400, f"不支持的文件类型：{ '、'.join(rejected[:5]) }{'…' if len(rejected) > 5 else ''}，"
+                 "仅支持 pdf/docx/md/txt 与常见图片格式"
+        )
+    saved_ids = []
+    skipped = []
+    for f, safe_name in prepared:
+        suffix = Path(safe_name).suffix.lower()
         doc_id = db.insert_document(safe_name, suffix, 0, "", kb_id=kb_id)
         dest = db.UPLOAD_DIR / f"{doc_id}_{safe_name}"
         size = 0
         hasher = hashlib.sha256()
-        with open(dest, "wb") as out:
-            while True:
-                buf = await f.read(1024 * 256)
-                if not buf:
-                    break
-                hasher.update(buf)
-                out.write(buf)
-                size += len(buf)
+        try:
+            with open(dest, "wb") as out:
+                while True:
+                    buf = await f.read(1024 * 256)
+                    if not buf:
+                        break
+                    hasher.update(buf)
+                    out.write(buf)
+                    size += len(buf)
+        except Exception:
+            # 写盘失败：回滚刚创建的记录与半截文件，避免残留 pending 文档
+            db.delete_document(doc_id)
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            raise HTTPException(500, f"文件 {safe_name} 保存失败")
         content_hash = hasher.hexdigest()
         dup = db.find_document_by_hash(content_hash, kb_id=kb_id)
         if dup:
@@ -189,7 +212,7 @@ async def upload(files: list[UploadFile] = File(...), kb_id: int | None = None,
         saved_ids.append(doc_id)
     for doc_id in saved_ids:
         background.add_task(_run_pipeline, doc_id)
-    return {"ok": True, "doc_ids": saved_ids, "skipped": skipped}
+    return {"ok": True, "doc_ids": saved_ids, "skipped": skipped, "rejected": rejected}
 
 
 async def _run_pipeline(doc_id: int):
@@ -226,6 +249,8 @@ def list_docs(kb_id: int | None = None):
 
 @app.delete("/api/documents/{doc_id}")
 def del_doc(doc_id: int):
+    if not db.get_document(doc_id):
+        raise HTTPException(404, "文档不存在")
     db.delete_document(doc_id)
     return {"ok": True}
 
@@ -240,7 +265,7 @@ async def reprocess_doc(doc_id: int, background: BackgroundTasks):
     doc = db.get_document(doc_id)
     if not doc:
         raise HTTPException(404, "文档不存在")
-    path = db.UPLOAD_DIR / f"{doc_id}_{doc['filename']}"
+    path = db.UPLOAD_DIR / f"{doc_id}_{Path(doc['filename']).name}"
     if not path.exists():
         raise HTTPException(400, "原始文件已丢失，请重新上传")
     db.reset_document_for_reprocess(doc_id)
@@ -265,7 +290,8 @@ async def _run_graph_build(doc_id: int):
         try:
             count = await graph.build_graph_for_doc(doc_id, force=True)
             await _post_graph_tasks(doc_id)
-            db.update_document(doc_id, status="done", stage="", triple_count=count)
+            # error 必须清空：否则上一次构建失败的错误提示会一直挂在已成功的文档上
+            db.update_document(doc_id, status="done", stage="", error="", triple_count=count)
         except Exception as e:
             db.update_document(doc_id, status="done", error=f"图谱构建失败：{e}")
 
@@ -283,8 +309,8 @@ def graph_stats_api(kb_id: int | None = None):
 
 
 @app.get("/api/graph/entity/{entity_id}")
-def entity_api(entity_id: int):
-    d = db.entity_detail(entity_id)
+def entity_api(entity_id: int, kb_id: int | None = None):
+    d = db.entity_detail(entity_id, kb_id=kb_id)
     if not d:
         raise HTTPException(404, "实体不存在")
     return d
@@ -297,6 +323,7 @@ class ChatIn(BaseModel):
     query: str
     mode: str | None = None   # 临时覆盖检索模式 vector/graph/hybrid
     kb_id: int | None = None  # 本次问答限定的知识库
+    web: bool | None = False  # 本次问答是否启用免费联网搜索
 
 
 @app.post("/api/chat")
@@ -326,10 +353,15 @@ async def chat(body: ChatIn):
         answer_parts = []
         refs = []
         msg_id = None
+        stats = None
         try:
-            async for ev in rag.answer_stream_events(query, history, mode_override=body.mode, kb_id=kb_id):
+            async for ev in rag.answer_stream_events(
+                query, history, mode_override=body.mode, kb_id=kb_id, web=bool(body.web)
+            ):
                 if ev["event"] == "meta":
                     refs = ev["data"].get("refs", [])
+                if ev["event"] == "stats":
+                    stats = ev["data"]
                 if ev["event"] == "delta":
                     answer_parts.append(ev["data"]["text"])
                 payload = json.dumps(ev["data"], ensure_ascii=False)
@@ -338,7 +370,7 @@ async def chat(body: ChatIn):
             yield f"event: error\ndata: {json.dumps({'message': str(e)[:300]}, ensure_ascii=False)}\n\n"
         finally:
             if answer_parts:
-                msg_id = db.add_message(body.chat_id, "assistant", "".join(answer_parts), refs)
+                msg_id = db.add_message(body.chat_id, "assistant", "".join(answer_parts), refs, stats=stats)
             else:
                 msg_id = db.add_message(
                     body.chat_id, "assistant",
@@ -394,25 +426,40 @@ class RetrieveIn(BaseModel):
     query: str
     mode: str | None = None
     kb_id: int | None = None
+    web: bool = False
 
 
 @app.post("/api/retrieve-preview")
 async def retrieve_preview(body: RetrieveIn):
     try:
-        chunks, gctx = await rag.retrieve(body.query, mode_override=body.mode, kb_id=body.kb_id)
+        chunks, gctx, _aux, web_ctx = await rag.retrieve(
+            body.query, mode_override=body.mode, kb_id=body.kb_id, web=bool(body.web)
+        )
     except ProviderError as e:
         return JSONResponse({"error": str(e)}, status_code=502)
     return {
         "chunks": [
-            {"n": i, "doc": _doc_name(c["doc_id"]), "score": round(float(c.get("score", 0)), 4), "text": c["text"][:600]}
+            {
+                "n": i,
+                "doc": (c.get("title") or c.get("url") or "网页")
+                       if c.get("source") == "web" else _doc_name(c["doc_id"]),
+                "score": round(float(c.get("score", 0)), 4),
+                "text": c["text"][:600],
+                "url": c.get("url"),
+                "source": c.get("source"),
+            }
             for i, c in enumerate(chunks, 1)
         ],
         "graph_entities": gctx.get("entities", []),
         "graph_triples": gctx.get("triples", [])[:30],
+        "web": web_ctx,
     }
 
 
 def _doc_name(doc_id: int) -> str:
+    # 图谱洞察产生的分块没有 doc_id，展示成「文档#None」会让人困惑
+    if not doc_id:
+        return "图谱洞察"
     d = db.get_document(doc_id)
     return d["filename"] if d else f"文档#{doc_id}"
 

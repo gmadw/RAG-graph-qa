@@ -1,8 +1,11 @@
-"""RAG 编排：检索（向量/图谱/混合）→ 重排 → 带引用的流式生成。"""
+"""RAG 编排：检索（向量/图谱/混合/联网）→ 重排 → 带引用的流式生成。"""
+import asyncio
 import json
+import re
+import time
 from . import db
 from .config import get_settings
-from .providers import llm_chat, rerank, ProviderError
+from .providers import llm_chat, rerank, ProviderError, estimate_tokens, estimate_messages_tokens
 from .vectorstore import vector_search
 from . import graph as kg
 
@@ -11,7 +14,17 @@ SYSTEM_PROMPT = """你是「知识库问答助手」，必须严格依据下面�
 要求：
 1. 优先使用参考资料中的信息；在句末用 [编号] 标注引用来源，如：……属于核心模块 [2]
 2. 参考资料中包含知识图谱三元组（形式为 A --关系--> B），它们是文档中抽取的事实，可用于推理和补充
-3. 若参考资料不足以回答，请明确说明"知识库中暂无相关信息"，不要编造
+3. 参考资料中可能包含联网搜索结果（会标注网页地址），请综合使用并注意信息时效性
+4. 若参考资料不足以回答，请明确说明"参考资料中暂无相关信息"，不要编造
+5. 用简体中文回答，结构清晰；涉及多个要点时使用列表
+"""
+
+WEB_SYSTEM_PROMPT = """你是「联网问答助手」。请严格依据下面提供的联网搜索结果回答用户问题。
+
+要求：
+1. 综合多条网页结果，在句末用 [编号] 标注引用来源
+2. 网页信息可能过时或相互矛盾，请优先采用更具体、更新的内容，并说明不确定性
+3. 若搜索结果不足以回答，请明确说明"联网搜索未找到足够信息"，不要编造
 4. 用简体中文回答，结构清晰；涉及多个要点时使用列表
 """
 
@@ -40,20 +53,21 @@ REWRITE_PROMPT = """你是查询改写助手。你的任务：根据对话历史
 改写后的问题："""
 
 
-async def rewrite_query(query: str, history: list) -> str:
-    """多轮对话指代消解：结合历史把当前问题改写为可独立检索的问句。失败时返回原文。"""
+async def rewrite_query(query: str, history: list):
+    """多轮对话指代消解：结合历史把当前问题改写为可独立检索的问句。
+    返回 (改写后问题, usage)；失败时返回原文。"""
     recent = [
         h for h in (history or [])
         if h.get("role") in ("user", "assistant") and (h.get("content") or "").strip()
     ]
     if not recent:
-        return query
+        return query, None
     lines = []
     for h in recent[-6:]:
         role = "用户" if h["role"] == "user" else "助手"
         lines.append(f"{role}：{h['content'][:300]}")
     try:
-        text = await llm_chat(
+        text, usage = await llm_chat(
             [{
                 "role": "user",
                 "content": REWRITE_PROMPT.format(history="\n".join(lines), query=query),
@@ -61,14 +75,109 @@ async def rewrite_query(query: str, history: list) -> str:
             stream=False,
             temperature=0.0,
             max_tokens=200,
+            return_usage=True,
         )
     except ProviderError:
-        return query
+        return query, None
     text = (text or "").strip().strip('"“”').strip()
-    # 异常输出（过长/空/换行堆叠）时退回原问题
+    # 异常输出（过长/空/换行堆叠）时退回原问题（调用本身已消耗，usage 照常返回）
     if not text or len(text) > 200 or text.count("\n") > 2:
-        return query
-    return text
+        return query, usage
+    return text, usage
+
+
+WEB_QUERY_PROMPT = """你是联网搜索查询构造助手。请把用户问题改写成适合搜索引擎的中文关键词查询。
+
+规则：
+1. 若问题中有“这篇文章/它/上述内容”等指代，请结合【检索到的资料】判断具体主题（文章标题、专有名词），并把主题写进查询
+2. 输出 3~8 个关键词，用空格分隔；不要问号、标点、序号或解释
+3. 保留专有名词原文（人名、产品名、作品名）
+4. 问题在问来源/出处/仿写时，保留“仿写/出处”等意图词
+5. 只输出查询本身
+
+【用户问题】
+{query}
+
+【检索到的资料】
+{context}
+
+搜索查询："""
+
+# 兜底去词：疑问词、指代词和虚词，避免把整句口语直接丢给搜索引擎
+_WEB_STOPWORDS = re.compile(
+    r"(请问|帮我|一下|这篇文章|该文章|本文|这篇|这段|这个|那个|这些|那些|"
+    r"是什么|是哪个|是哪些|为什么|怎么样|怎么|如何|是否|是|的|了|吗|呢|吧|啊|呀|"
+    r"与|和|及|或|在|有|我|你|他|她|它|们|"
+    r"[？?！!，,。.、；;：:\"“”《》()（）\s]+)"
+)
+
+
+def _query_context(chunks, limit: int = 2, chars: int = 400) -> str:
+    """取本地检索到的前几段资料，用于消解问题中的指代。"""
+    parts = []
+    for c in chunks or []:
+        if c.get("source") == "web":
+            continue
+        text = (c.get("text") or "").strip()
+        if text:
+            parts.append(text[:chars])
+        if len(parts) >= limit:
+            break
+    return "\n".join(parts)
+
+
+def _clean_search_query(text: str) -> str:
+    """清洗模型输出的搜索词：只取一行、去标点包装、拒绝异常输出。"""
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    line = line.strip().strip('"“”『』「」`').strip()
+    line = re.sub(r"^(搜索查询|查询|关键词)[:：]\s*", "", line)
+    line = re.sub(r"\s+", " ", line).strip()
+    if not line or len(line) > 80:
+        return ""
+    if any(w in line for w in ("抱歉", "无法", "不能", "作为AI")):
+        return ""
+    return line
+
+
+def _fallback_web_query(question: str, chunks) -> str:
+    """模型不可用时的兜底：去掉疑问/指代词；若问题有指代，补上资料里的小标题。"""
+    q = _WEB_STOPWORDS.sub(" ", question or "")
+    q = re.sub(r"\s+", " ", q).strip() or (question or "").strip()
+    title = ""
+    if re.search(r"(这篇文章|该文章|本文|这篇|这段|它)", question or ""):
+        for line in _query_context(chunks, limit=1, chars=300).splitlines():
+            s = line.strip()
+            if (2 <= len(s) <= 20 and not re.search(r"[，。！？!?：:；;]", s)
+                    and "引用" not in s and "思考" not in s):
+                title = s
+                break
+    if title and title not in q:
+        q = f"{title} {q}".strip()
+    return (q or (question or "").strip())[:80]
+
+
+async def build_web_query(query: str, chunks) -> tuple:
+    """构造联网搜索关键词：结合本地检索资料，把「这篇文章」等指代换成具体主题。
+
+    返回 (搜索词, usage)；模型不可用或输出异常时退回规则兜底。
+    """
+    ctx = _query_context(chunks)
+    if not ctx:
+        return _fallback_web_query(query, chunks), None
+    try:
+        text, usage = await asyncio.wait_for(
+            llm_chat(
+                [{"role": "user", "content": WEB_QUERY_PROMPT.format(query=query, context=ctx)}],
+                stream=False,
+                temperature=0.0,
+                max_tokens=60,
+                return_usage=True,
+            ),
+            timeout=15,  # 查询改写不能拖慢联网搜索；超时直接用规则兜底
+        )
+    except (ProviderError, asyncio.TimeoutError):
+        return _fallback_web_query(query, chunks), None
+    return (_clean_search_query(text) or _fallback_web_query(query, chunks)), usage
 
 
 def _rrf_merge(result_lists, k=60):
@@ -90,11 +199,26 @@ def _rrf_merge(result_lists, k=60):
     return out
 
 
-async def retrieve(query: str, mode_override: str = None, kb_id: int = None):
-    """检索 + 可选重排。返回 (chunks, graph_ctx)。
+def _add_usage(dst: dict, src: dict | None):
+    """把一次模型调用的 usage 累加进汇总字典。"""
+    if not src:
+        return
+    for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        dst[k] = dst.get(k, 0) + int(src.get(k) or 0)
+    if src.get("estimated"):
+        dst["estimated"] = True
+
+
+def _new_usage() -> dict:
+    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "estimated": False}
+
+
+async def retrieve(query: str, mode_override: str = None, kb_id: int = None, web: bool = False):
+    """检索 + 可选重排。返回 (chunks, graph_ctx, aux_usage, web_ctx)。
     模式：vector 纯向量 / graph 纯图谱 / hybrid 混合（RRF 融合）/
-          insights 图谱洞察（社群+中心性分析）/ natural 纯模型（不检索）。
-    指定 kb_id 时仅在该知识库范围内检索。
+          insights 图谱洞察（社群+中心性分析）/ natural 纯模型（不检索）/
+          web 仅联网搜索（由「纯模型问答 + 联网搜索」组合进入）。
+    指定 kb_id 时仅在该知识库范围内检索；web=True 时额外抓取网页结果并追加到 chunks。
     """
     cfg = get_settings()
     rcfg = cfg.get("retrieval", {})
@@ -103,28 +227,40 @@ async def retrieve(query: str, mode_override: str = None, kb_id: int = None):
     hops = int(rcfg.get("graph_hops", 2))
 
     graph_ctx = {"triples": [], "entities": []}
+    web_ctx = {"enabled": bool(web), "count": 0, "error": "", "query": ""}
+    aux = _new_usage()
+    if mode == "natural" and not web:
+        return [], graph_ctx, aux, web_ctx
     if mode == "natural":
-        return [], graph_ctx
-    if mode == "vector":
-        vec_hits, _ = await vector_search(query, top_k=top_k, kb_id=kb_id)
+        mode = "web"
+    if mode == "web":
+        chunks = []
+    elif mode == "vector":
+        vec_hits, _, u = await vector_search(query, top_k=top_k, kb_id=kb_id)
+        _add_usage(aux, u)
         chunks = vec_hits
     elif mode == "graph":
         g = await kg.graph_search(query, hops=hops, top_k=top_k, kb_id=kb_id)
+        _add_usage(aux, g.get("usage"))
         graph_ctx = {"triples": g["triples"], "entities": g["entities"]}
         chunks = g["chunks"]
     elif mode == "insights":
         g = await kg.graph_insights(query, hops=hops, top_k=top_k, kb_id=kb_id)
+        _add_usage(aux, g.get("usage"))
         graph_ctx = {"triples": g["triples"], "entities": g["entities"]}
         chunks = g["chunks"]
     else:
-        vec_hits, _ = await vector_search(query, top_k=top_k, kb_id=kb_id)
+        vec_hits, _, u = await vector_search(query, top_k=top_k, kb_id=kb_id)
+        _add_usage(aux, u)
         g = await kg.graph_search(query, hops=hops, top_k=top_k, kb_id=kb_id)
+        _add_usage(aux, g.get("usage"))
         graph_ctx = {"triples": g["triples"], "entities": g["entities"]}
         chunks = _rrf_merge([vec_hits, g["chunks"]])[: top_k + 3]
 
     # 在线图谱补全：为图谱上下文补充 LLM 推理出的隐含关系
     if cfg.get("graph", {}).get("completion") and mode in ("graph", "hybrid", "insights"):
-        inferred = await kg.complete_subgraph(query, graph_ctx["triples"])
+        inferred, u = await kg.complete_subgraph(query, graph_ctx["triples"])
+        _add_usage(aux, u)
         if inferred:
             graph_ctx["triples"] = graph_ctx["triples"] + inferred
 
@@ -154,7 +290,26 @@ async def retrieve(query: str, mode_override: str = None, kb_id: int = None):
             pass
     else:
         chunks = chunks[:top_k]
-    return chunks, graph_ctx
+
+    # 联网搜索放在本地检索与重排之后：网页结果不参与向量/图谱排序，
+    # 但会作为额外引用追加进上下文。搜索词先结合本地资料消解「这篇文章」等指代，
+    # 避免把整句口语丢给搜索引擎导致只命中首个词（如只搜「这」）。
+    if web:
+        from . import websearch
+        web_query, wq_usage = await build_web_query(query, chunks)
+        _add_usage(aux, wq_usage)
+        web_ctx["query"] = web_query
+        try:
+            got = await asyncio.wait_for(
+                websearch.search_and_fetch(web_query, limit=5, pages=3, max_chars=1500),
+                timeout=25,
+            )
+            web_chunks = got.get("chunks") or []
+            chunks = chunks + web_chunks
+            web_ctx["count"] = len(web_chunks)
+        except Exception as e:  # 网络不可用/被限流时降级为仅知识库回答
+            web_ctx["error"] = (str(e).strip() or type(e).__name__)[:200]
+    return chunks, graph_ctx, aux, web_ctx
 
 
 def build_context(chunks, graph_ctx, max_chars=6000):
@@ -162,7 +317,10 @@ def build_context(chunks, graph_ctx, max_chars=6000):
     parts = []
     used = 0
     for i, c in enumerate(chunks, 1):
-        text = c["text"][:1200]
+        is_web = c.get("source") == "web"
+        text = c["text"][:1500 if is_web else 1200]
+        if is_web and c.get("url"):
+            text = f"（网页来源：{c['url']}）\n{text}"
         if used + len(text) > max_chars:
             text = text[: max_chars - used]
         parts.append(f"[{i}] {text}")
@@ -182,7 +340,9 @@ def refs_payload(chunks, graph_ctx):
     refs = []
     for i, c in enumerate(chunks, 1):
         doc_id = c.get("doc_id")
-        if doc_id:
+        if c.get("source") == "web":
+            doc = c.get("title") or c.get("url") or "网页"
+        elif doc_id:
             d = conn.execute(
                 "SELECT filename FROM documents WHERE id=?", (doc_id,)
             ).fetchone()
@@ -195,21 +355,54 @@ def refs_payload(chunks, graph_ctx):
             "score": round(float(c.get("score", 0)), 4),
             "text": c["text"][:600],
             "chunk_id": c.get("chunk_id"),
+            "url": c.get("url"),
+            "source": c.get("source"),
         })
     return refs
 
 
+def _compose_stats(model_name: str, messages, answer_text: str, usage: dict | None,
+                   t0: float, ttft_ms) -> dict:
+    """汇总回答生成的 token 用量与速率。上游未返回 usage 时按字符数估算。"""
+    if usage:
+        p = int(usage.get("prompt_tokens") or 0)
+        c = int(usage.get("completion_tokens") or 0)
+        est = bool(usage.get("estimated"))
+    else:
+        p, c, est = estimate_messages_tokens(messages), estimate_tokens(answer_text), True
+    now = time.perf_counter()
+    latency_ms = round((now - t0) * 1000)
+    gen_ms = None if ttft_ms is None else max(1, latency_ms - ttft_ms)
+    tps = None
+    if gen_ms and c > 0:
+        tps = round(c / (gen_ms / 1000), 1)
+    return {
+        "model": model_name,
+        "prompt_tokens": p,
+        "completion_tokens": c,
+        "total_tokens": p + c,
+        "estimated": est,
+        "ttft_ms": ttft_ms,
+        "gen_ms": gen_ms,
+        "latency_ms": latency_ms,
+        "tps": tps,
+    }
+
+
 async def answer_stream_events(query: str, history: list, mode_override: str = None,
-                              kb_id: int = None):
+                              kb_id: int = None, web: bool = False):
     """生成器：依次 yield SSE 事件 dict。
-    事件：meta（引用/模式）→ 多个 delta → done / error
-    kb_id 用于限定本次问答检索的知识库范围。
+    事件：meta（引用/模式）→ 多个 delta → stats（模型用量与速率）→ done / error
+    kb_id 用于限定本次问答检索的知识库范围；web=True 时启用免费联网搜索。
     """
     cfg = get_settings()
     mode = mode_override or cfg.get("retrieval", {}).get("mode", "hybrid")
+    model_name = (cfg.get("llm") or {}).get("model") or "?"
+    t_total0 = time.perf_counter()
 
-    # 纯模型问答：不走检索，直接用模型自身知识回答
-    if mode == "natural":
+    # 纯模型问答：不走检索，直接用模型自身知识回答。
+    # 若同时开启联网搜索，则退化为「仅联网模式」，把网页结果作为参考资料。
+    if mode == "natural" and not web:
         yield {
             "event": "meta",
             "data": {
@@ -224,20 +417,38 @@ async def answer_stream_events(query: str, history: list, mode_override: str = N
         for h in history[-6:]:
             messages.append({"role": h["role"], "content": h["content"]})
         messages.append({"role": "user", "content": query})
+        t0 = time.perf_counter()
+        ttft_ms, usage, full = None, None, []
         try:
             stream = await llm_chat(messages, stream=True, temperature=0.3)
-            async for piece in stream:
+            async for piece, u in stream:
+                # 只在真正收到正文时记首字延迟：仅含 usage 的空分块不算首字
+                if ttft_ms is None and piece:
+                    ttft_ms = round((time.perf_counter() - t0) * 1000)
+                if u:
+                    usage = u
+                full.append(piece)
                 yield {"event": "delta", "data": {"text": piece}}
         except ProviderError as e:
             yield {"event": "error", "data": {"message": f"LLM 调用失败：{e}"}}
             return
+        stats = _compose_stats(model_name, messages, "".join(full), usage, t0, ttft_ms)
+        yield {"event": "stats", "data": stats}
         yield {"event": "done", "data": {}}
         return
 
+    # 「纯模型问答 + 联网搜索」：只用网页结果，不查本地知识库
+    effective_mode = "web" if mode == "natural" else mode
+
     # 多轮对话：先把当前问题改写成可独立检索的问句（指代消解）
-    search_query = await rewrite_query(query, history)
+    aux = _new_usage()
+    search_query, rw_usage = await rewrite_query(query, history)
+    _add_usage(aux, rw_usage)
     try:
-        chunks, graph_ctx = await retrieve(search_query, mode_override=mode_override, kb_id=kb_id)
+        chunks, graph_ctx, ret_usage, web_ctx = await retrieve(
+            search_query, mode_override=effective_mode, kb_id=kb_id, web=web
+        )
+        _add_usage(aux, ret_usage)
     except ProviderError as e:
         yield {"event": "error", "data": {"message": f"检索失败：{e}"}}
         return
@@ -246,22 +457,39 @@ async def answer_stream_events(query: str, history: list, mode_override: str = N
     yield {
         "event": "meta",
         "data": {
-            "mode": mode,
+            "mode": effective_mode,
             "refs": refs,
             "graph_entities": graph_ctx.get("entities", []),
             "graph_triples": graph_ctx.get("triples", [])[:20],
             "search_query": search_query if search_query != query else None,
+            "web": web_ctx,
         },
     }
 
     if not chunks and not graph_ctx.get("triples"):
-        msg = "知识库中暂无与该问题相关的信息。请先上传文档，或尝试更换检索模式 / 关键词。"
+        if web:
+            msg = "知识库与联网搜索均未获取到有效结果"
+            if web_ctx.get("error"):
+                msg += f"（{web_ctx['error']}）"
+            msg += "。请更换关键词，或关闭联网搜索后重试。"
+        else:
+            msg = "知识库中暂无与该问题相关的信息。请先上传文档，或尝试更换检索模式 / 关键词。"
         yield {"event": "delta", "data": {"text": msg}}
+        # 无生成调用，但检索辅助调用的开销照常呈现
+        yield {"event": "stats", "data": {
+            "model": model_name, "prompt_tokens": 0, "completion_tokens": 0,
+            "total_tokens": 0, "aux_tokens": aux["total_tokens"],
+            "estimated": aux["estimated"], "ttft_ms": None, "gen_ms": None,
+            "tps": None, "latency_ms": round((time.perf_counter() - t_total0) * 1000),
+        }}
         yield {"event": "done", "data": {}}
         return
 
-    ctx = build_context(chunks, graph_ctx)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # 联网结果通常需要更多上下文篇幅
+    max_ctx = 9000 if any(c.get("source") == "web" for c in chunks) else 6000
+    ctx = build_context(chunks, graph_ctx, max_chars=max_ctx)
+    system_prompt = WEB_SYSTEM_PROMPT if effective_mode == "web" else SYSTEM_PROMPT
+    messages = [{"role": "system", "content": system_prompt}]
     for h in history[-6:]:
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({
@@ -269,10 +497,16 @@ async def answer_stream_events(query: str, history: list, mode_override: str = N
         "content": f"【参考资料】\n{ctx}\n\n【用户问题】\n{query}",
     })
 
-    full = []
+    t0 = time.perf_counter()
+    ttft_ms, usage, full = None, None, []
     try:
         stream = await llm_chat(messages, stream=True, temperature=0.3)
-        async for piece in stream:
+        async for piece, u in stream:
+            # 只在真正收到正文时记首字延迟：仅含 usage 的空分块不算首字
+            if ttft_ms is None and piece:
+                ttft_ms = round((time.perf_counter() - t0) * 1000)
+            if u:
+                usage = u
             full.append(piece)
             yield {"event": "delta", "data": {"text": piece}}
     except ProviderError as e:
@@ -281,4 +515,9 @@ async def answer_stream_events(query: str, history: list, mode_override: str = N
         else:
             yield {"event": "error", "data": {"message": f"LLM 调用失败：{e}"}}
         return
+    stats = _compose_stats(model_name, messages, "".join(full), usage, t0, ttft_ms)
+    stats["aux_tokens"] = aux["total_tokens"]
+    if aux["estimated"]:
+        stats["estimated"] = True
+    yield {"event": "stats", "data": stats}
     yield {"event": "done", "data": {}}

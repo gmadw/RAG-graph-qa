@@ -47,8 +47,50 @@ def _headers(key: str) -> dict:
 
 # ---------------- LLM ----------------
 
-async def llm_chat(messages, stream=False, temperature=None, max_tokens=2048, section="llm"):
-    """调用 chat/completions。stream=False 返回完整文本；stream=True 返回异步迭代器(yield str)。"""
+def estimate_tokens(text: str) -> int:
+    """粗略估算 token 数：CJK 字符 ≈1 token/字，其余 ≈1/4 token/字符。
+
+    仅在上游未返回 usage 时兜底（前端会标注「估算值」），不追求精确。
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if "\u3400" <= ch <= "\u9fff")
+    return max(1, round(cjk + (len(text) - cjk) / 4))
+
+
+def estimate_messages_tokens(messages) -> int:
+    """按消息列表估算 prompt tokens。"""
+    return sum(
+        estimate_tokens(m.get("content") or "")
+        for m in (messages or []) if isinstance(m, dict)
+    )
+
+
+def _norm_usage(u) -> dict | None:
+    """统一各家 usage 字段口径（prompt/completion 或 input/output），无用量返回 None。"""
+    if not isinstance(u, dict):
+        return None
+    p = u.get("prompt_tokens", u.get("input_tokens"))
+    c = u.get("completion_tokens", u.get("output_tokens"))
+    if p is None and c is None:
+        return None
+    p, c = int(p or 0), int(c or 0)
+    return {
+        "prompt_tokens": p,
+        "completion_tokens": c,
+        "total_tokens": int(u.get("total_tokens") or (p + c)),
+        "estimated": False,
+    }
+
+
+async def llm_chat(messages, stream=False, temperature=None, max_tokens=2048, section="llm",
+                   return_usage=False):
+    """调用 chat/completions。
+
+    stream=False：返回完整文本；return_usage=True 时返回 (文本, usage)。
+    stream=True：返回异步迭代器，逐项 yield (文本增量, usage)；usage 仅在
+    上游携带用量的分块出现（多为最后一个分块），其余为 None。
+    """
     conf = _conf(section)
     temperature = 0.3 if temperature is None else temperature
     payload = {
@@ -68,13 +110,26 @@ async def llm_chat(messages, stream=False, temperature=None, max_tokens=2048, se
             if r.status_code != 200:
                 raise ProviderError(f"LLM HTTP {r.status_code}: {r.text[:300]}")
             data = r.json()
-        return data["choices"][0]["message"]["content"] or ""
+        choices = data.get("choices") or []
+        if not choices:
+            raise ProviderError(f"LLM 返回异常（无 choices）：{str(data)[:200]}")
+        text = (choices[0].get("message") or {}).get("content") or ""
+        usage = _norm_usage(data.get("usage"))
+        if usage is None:
+            p, c = estimate_messages_tokens(messages), estimate_tokens(text)
+            usage = {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c,
+                     "estimated": True}
+        return (text, usage) if return_usage else text
     except httpx.HTTPError as e:
         raise ProviderError(f"LLM 网络错误：{e}") from e
 
 
 async def _stream_sse(url, key, payload):
-    """SSE 流式解析，逐段 yield 文本增量。"""
+    """SSE 流式解析，逐段 yield (文本增量, usage)。
+
+    usage 只在上游携带时出现（OpenAI 风格可能是最后一个仅含 usage 的空 choices 分块），
+    消费方拿不到时自行按字符估算。
+    """
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             async with client.stream("POST", url, headers=_headers(key), json=payload) as r:
@@ -91,20 +146,27 @@ async def _stream_sse(url, key, payload):
                         obj = json.loads(data)
                     except Exception:
                         continue
+                    piece, usage = "", None
                     choices = obj.get("choices") or []
                     if choices:
                         delta = choices[0].get("delta") or {}
                         piece = delta.get("content") or ""
-                        if piece:
-                            yield piece
+                    if obj.get("usage") is not None:
+                        usage = _norm_usage(obj.get("usage"))
+                    if piece or usage:
+                        yield piece, usage
     except httpx.HTTPError as e:
         raise ProviderError(f"LLM 流式网络错误：{e}") from e
 
 
-async def llm_json(messages, max_tokens=2048, section="llm"):
-    """调用 LLM 并解析 JSON 输出（容忍围栏/前后杂质）。"""
-    text = await llm_chat(messages, stream=False, temperature=0.0, max_tokens=max_tokens, section=section)
-    return parse_json_loose(text)
+async def llm_json(messages, max_tokens=2048, section="llm", return_usage=False):
+    """调用 LLM 并解析 JSON 输出（容忍围栏/前后杂质）。return_usage=True 时返回 (对象, usage)。"""
+    text, usage = await llm_chat(
+        messages, stream=False, temperature=0.0, max_tokens=max_tokens,
+        section=section, return_usage=True,
+    )
+    parsed = parse_json_loose(text)
+    return (parsed, usage) if return_usage else parsed
 
 
 def parse_json_loose(text: str):
@@ -130,9 +192,12 @@ def parse_json_loose(text: str):
 
 # ---------------- Embedding ----------------
 
-async def embed_texts(texts: list) -> list:
+async def embed_texts(texts: list, return_usage: bool = False):
+    """批量向量化。return_usage=True 时返回 (向量列表, usage)。"""
     conf = _conf("embedding")
     out = []
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "estimated": False}
+    got_usage = False
     batch = 16
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         for i in range(0, len(texts), batch):
@@ -146,9 +211,17 @@ async def embed_texts(texts: list) -> list:
                 raise ProviderError(f"Embedding 网络错误：{e}") from e
             if r.status_code != 200:
                 raise ProviderError(f"Embedding HTTP {r.status_code}: {r.text[:300]}")
-            data = r.json()["data"]
-            out.extend(d["embedding"] for d in data)
-    return out
+            data = r.json()
+            out.extend(d["embedding"] for d in data["data"])
+            u = _norm_usage(data.get("usage"))
+            if u:
+                got_usage = True
+                usage["prompt_tokens"] += u["prompt_tokens"]
+                usage["total_tokens"] += u["total_tokens"]
+    if not got_usage:
+        t = sum(estimate_tokens(x) for x in texts)
+        usage = {"prompt_tokens": t, "completion_tokens": 0, "total_tokens": t, "estimated": True}
+    return (out, usage) if return_usage else out
 
 
 # ---------------- Rerank ----------------

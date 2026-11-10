@@ -219,12 +219,14 @@ async def describe_entities_for_doc(doc_id: int, limit: int = 60) -> int:
     return updated
 
 
-async def link_entities(query: str, kb_id: int = None) -> list:
+async def link_entities(query: str, kb_id: int = None):
     """问题 → 实体链接（图数据库中匹配到的实体 id 列表）。
-    指定 kb_id 时仅保留参与该知识库关系网络的实体，避免跨库串味。"""
-    raw = await llm_json(
+    指定 kb_id 时仅保留参与该知识库关系网络的实体，避免跨库串味。
+    返回 (实体列表, usage)。"""
+    raw, usage = await llm_json(
         [{"role": "user", "content": LINK_PROMPT + query}],
         max_tokens=200,
+        return_usage=True,
     )
     keywords = []
     if isinstance(raw, list):
@@ -248,7 +250,7 @@ async def link_entities(query: str, kb_id: int = None) -> list:
             filtered = [e for e in matched if (e.get("type") or "") in types]
             if filtered:
                 matched = filtered
-    return matched
+    return matched, usage
 
 
 def _split_types(text: str) -> list:
@@ -264,10 +266,11 @@ async def graph_search(query: str, hops: int = 2, top_k: int = 8, kb_id: int = N
       chunks: [{chunk_id, doc_id, text, score}]
       triples: ["A --关系--> B", ...]
       entities: 匹配到的实体名列表
+      usage: 本次检索的 LLM 调用用量（可为 None）
     """
-    ents = await link_entities(query, kb_id=kb_id)
+    ents, link_usage = await link_entities(query, kb_id=kb_id)
     if not ents:
-        return {"chunks": [], "triples": [], "entities": []}
+        return {"chunks": [], "triples": [], "entities": [], "usage": link_usage}
 
     conn = db.get_conn()
     kb_doc_sub = "(SELECT id FROM documents WHERE kb_id=?)"
@@ -276,6 +279,15 @@ async def graph_search(query: str, hops: int = 2, top_k: int = 8, kb_id: int = N
     chunk_score = {}   # chunk_id -> score
     triples = []
     ent_names = {e["name"] for e in ents}
+
+    # 实体名缓存：同一实体在多跳扩展里会被反复取名称，避免逐条 N+1 查询
+    name_cache = {e["id"]: e["name"] for e in ents}
+
+    def ent_name(eid):
+        if eid not in name_cache:
+            row = conn.execute("SELECT name FROM entities WHERE id=?", (eid,)).fetchone()
+            name_cache[eid] = row["name"] if row else None
+        return name_cache[eid]
 
     for hop in range(max(1, min(hops, 3))):
         if not frontier:
@@ -297,16 +309,16 @@ async def graph_search(query: str, hops: int = 2, top_k: int = 8, kb_id: int = N
             ).fetchall()
         next_frontier = {}
         for r in rows:
-            for eid, name_key in ((r["head_id"], "h"), (r["tail_id"], "t")):
+            for eid in (r["head_id"], r["tail_id"]):
                 if eid not in visited:
                     row = conn.execute("SELECT id,name,type FROM entities WHERE id=?", (eid,)).fetchone()
                     if row:
                         next_frontier[eid] = dict(row)
                         visited.add(eid)
-            h = conn.execute("SELECT name FROM entities WHERE id=?", (r["head_id"],)).fetchone()
-            t = conn.execute("SELECT name FROM entities WHERE id=?", (r["tail_id"],)).fetchone()
+                        name_cache.setdefault(eid, row["name"])
+            h, t = ent_name(r["head_id"]), ent_name(r["tail_id"])
             if h and t:
-                triple_txt = f"{h['name']} --{r['relation']}--> {t['name']}"
+                triple_txt = f"{h} --{r['relation']}--> {t}"
                 if triple_txt not in triples:
                     triples.append(triple_txt)
             if r["chunk_id"] is not None:
@@ -334,7 +346,7 @@ async def graph_search(query: str, hops: int = 2, top_k: int = 8, kb_id: int = N
                 chunk_score[r["id"]] = chunk_score.get(r["id"], 0.0) + 0.6
 
     if not chunk_score:
-        return {"chunks": [], "triples": triples, "entities": sorted(ent_names)}
+        return {"chunks": [], "triples": triples, "entities": sorted(ent_names), "usage": link_usage}
 
     ranked = sorted(chunk_score.items(), key=lambda x: -x[1])[:top_k]
     marks = ",".join("?" * len(ranked))
@@ -347,7 +359,7 @@ async def graph_search(query: str, hops: int = 2, top_k: int = 8, kb_id: int = N
         r = row_map.get(cid)
         if r:
             chunks.append({"chunk_id": cid, "doc_id": r["doc_id"], "text": r["text"], "score": float(sc)})
-    return {"chunks": chunks, "triples": triples, "entities": sorted(ent_names)}
+    return {"chunks": chunks, "triples": triples, "entities": sorted(ent_names), "usage": link_usage}
 
 
 # ---------------- 图谱补全（graph completion） ----------------
@@ -465,12 +477,13 @@ async def complete_graph_for_doc(doc_id: int, max_new: int = 20) -> int:
     return added
 
 
-async def complete_subgraph(query: str, triples: list) -> list:
-    """在线图谱补全：基于检索到的三元组，推理与问题相关的隐含关系（不写入库）。"""
+async def complete_subgraph(query: str, triples: list):
+    """在线图谱补全：基于检索到的三元组，推理与问题相关的隐含关系（不写入库）。
+    返回 (推断三元组列表, usage)。"""
     if not triples:
-        return []
+        return [], None
     try:
-        raw = await llm_json(
+        raw, usage = await llm_json(
             [{
                 "role": "user",
                 "content": COMPLETE_QUERY_PROMPT.format(
@@ -478,9 +491,10 @@ async def complete_subgraph(query: str, triples: list) -> list:
                 ),
             }],
             max_tokens=800,
+            return_usage=True,
         )
     except ProviderError:
-        return []
+        return [], None
     out = []
     for item in raw or []:
         if isinstance(item, dict):
@@ -489,7 +503,7 @@ async def complete_subgraph(query: str, triples: list) -> list:
                 out.append(f"{h} --{rel}--> {t}（推断）")
         elif isinstance(item, str) and "--" in item:
             out.append(item.strip()[:120] + "（推断）")
-    return out[:6]
+    return out[:6], usage
 
 
 # ---------------- 图谱洞察（insights） ----------------
@@ -502,7 +516,7 @@ async def graph_insights(query: str, hops: int = 2, top_k: int = 8, kb_id: int =
     """
     conn = db.get_conn()
     kb_doc_sub = "(SELECT id FROM documents WHERE kb_id=?)"
-    ents = await link_entities(query, kb_id=kb_id)
+    ents, link_usage = await link_entities(query, kb_id=kb_id)
     if ents:
         seed = {e["id"] for e in ents}
         for _ in range(max(1, min(hops, 3))):
@@ -545,7 +559,7 @@ async def graph_insights(query: str, hops: int = 2, top_k: int = 8, kb_id: int =
                 f"WHERE doc_id IN {kb_doc_sub} LIMIT 800", (kb_id,)
             ).fetchall()
     if not rows:
-        return {"chunks": [], "triples": [], "entities": []}
+        return {"chunks": [], "triples": [], "entities": [], "usage": link_usage}
 
     G = nx.Graph()
     for r in rows:
@@ -602,7 +616,7 @@ async def graph_insights(query: str, hops: int = 2, top_k: int = 8, kb_id: int =
         ]
         insights.append("【关键桥接实体（连接不同社群）】\n" + "\n".join(lines))
     if not insights:
-        return {"chunks": [], "triples": [], "entities": ent_names}
+        return {"chunks": [], "triples": [], "entities": ent_names, "usage": link_usage}
 
     triples = []
     for r in rows[:60]:
@@ -615,4 +629,4 @@ async def graph_insights(query: str, hops: int = 2, top_k: int = 8, kb_id: int =
         {"chunk_id": None, "doc_id": None, "text": text, "score": float(len(insights) - i)}
         for i, text in enumerate(insights)
     ]
-    return {"chunks": chunks, "triples": triples, "entities": ent_names}
+    return {"chunks": chunks, "triples": triples, "entities": ent_names, "usage": link_usage}

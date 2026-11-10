@@ -73,6 +73,9 @@ PRESETS = {
         "embed_models": ["mock-embed"],
         "rerank_model": "mock-rerank",
         "rerank_models": ["mock-rerank"],
+        # OCR 字段必须存在（哪怕为空）：缺少时前端切换预设会残留上一家的模型名
+        "ocr_model": "",
+        "ocr_models": [],
         "note": "本地规则式伪模型，仅用于跑通流程；真实效果请配置其他提供商",
         "key_url": "",
     },
@@ -190,11 +193,15 @@ def default_settings() -> dict:
     }
     if os.environ.get("RAG_MOCK") == "1":
         mk = PRESETS["mock"]
-        ds["llm"] = {"provider": "mock", "base_url": mk["base_url"], "api_key": "mock",
+        # 跟随 MOCK_PORT：start.bat / start.sh 允许改 Mock 端口，若仍写死 9999
+        # 会出现「Mock 起在 9998、主服务却连 9999」的错配。
+        port = (os.environ.get("MOCK_PORT") or "").strip()
+        base = f"http://127.0.0.1:{port}/v1" if port.isdigit() else mk["base_url"]
+        ds["llm"] = {"provider": "mock", "base_url": base, "api_key": "mock",
                      "model": mk["llm_model"], "temperature": 0.3}
-        ds["embedding"] = {"provider": "mock", "base_url": mk["base_url"], "api_key": "mock",
+        ds["embedding"] = {"provider": "mock", "base_url": base, "api_key": "mock",
                            "model": mk["embed_model"]}
-        ds["rerank"] = {"provider": "mock", "base_url": mk["base_url"], "api_key": "mock",
+        ds["rerank"] = {"provider": "mock", "base_url": base, "api_key": "mock",
                         "model": mk["rerank_model"], "enabled": True}
     return ds
 
@@ -251,13 +258,16 @@ def save_settings(new_cfg: dict) -> dict:
             merged[k] = new_cfg.get(k, stored.get(k, v))
     # 已下线提供商（如历史上的智谱）在保存时同样迁移，避免脏配置被写回
     merged = _reuse_provider_keys(_migrate_retired(merged))
-    # api_key 打码处理：前端回传 "____" 前缀的占位值时保留原值
+    # api_key 打码处理：前端回传 "••" 打码值时保留原值；显式留空视为用户要清除。
+    # 但只有在「提供商没换」时才能沿用旧 Key——换了服务商旧 Key 必然无效。
     for section in ("llm", "embedding", "rerank", "ocr"):
-        old_key = (current.get(section) or {}).get("api_key", "")
-        new_key = (merged.get(section) or {}).get("api_key", "")
-        # 打码回传（含 ••）或清空时，保留原 key 不变
-        if "••" in new_key or new_key.strip() == "":
-            merged[section]["api_key"] = old_key
+        old_sec = current.get(section) or {}
+        new_sec = merged.get(section) or {}
+        old_key = old_sec.get("api_key") or ""
+        new_key = new_sec.get("api_key") or ""
+        if "••" in new_key:
+            same_provider = new_sec.get("provider") == old_sec.get("provider")
+            new_sec["api_key"] = old_key if same_provider else ""
     db.set_setting("settings", merged)
     return merged
 

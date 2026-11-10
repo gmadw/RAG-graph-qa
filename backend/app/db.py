@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS messages(
   role TEXT,
   content TEXT DEFAULT '',
   refs TEXT DEFAULT '[]',
+  stats TEXT DEFAULT '',              -- 模型用量统计 JSON（token/速率），空串表示无
   created_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
@@ -146,6 +147,10 @@ def _migrate(conn):
         ccols = {r["name"] for r in conn.execute("PRAGMA table_info(chats)").fetchall()}
         if "kb_id" not in ccols:
             conn.execute("ALTER TABLE chats ADD COLUMN kb_id INTEGER")
+    if "messages" in tables:
+        mcols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "stats" not in mcols:
+            conn.execute("ALTER TABLE messages ADD COLUMN stats TEXT DEFAULT ''")
     conn.commit()
 
 
@@ -360,6 +365,11 @@ def reset_document_for_reprocess(doc_id: int):
     """清空分块与图谱关系并重置状态，用于重新解析（例如启用 OCR 后重跑扫描件）。"""
     with write_lock:
         conn = get_conn()
+        # 分块重建后 chunk id 全部失效，对应的反馈记录也要一并清掉，避免脏数据长期影响排序
+        conn.execute(
+            "DELETE FROM feedback WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id=?)",
+            (doc_id,),
+        )
         conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
         conn.execute("DELETE FROM relations WHERE doc_id=?", (doc_id,))
         conn.execute(
@@ -375,8 +385,15 @@ def reset_document_for_reprocess(doc_id: int):
 
 
 def delete_document(doc_id: int):
+    filename = None
     with write_lock:
         conn = get_conn()
+        row = conn.execute("SELECT filename FROM documents WHERE id=?", (doc_id,)).fetchone()
+        filename = row["filename"] if row else None
+        conn.execute(
+            "DELETE FROM feedback WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id=?)",
+            (doc_id,),
+        )
         conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
         conn.execute("DELETE FROM relations WHERE doc_id=?", (doc_id,))
         conn.execute(
@@ -385,6 +402,12 @@ def delete_document(doc_id: int):
         )
         conn.execute("DELETE FROM documents WHERE id=?", (doc_id,))
         conn.commit()
+    # 同步删除 uploads 下的原始文件，否则删除文档/知识库后文件会永久残留
+    if filename:
+        try:
+            (UPLOAD_DIR / f"{doc_id}_{Path(filename).name}").unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def insert_chunks(doc_id: int, embed_tag: str, items):
@@ -748,17 +771,22 @@ def graph_data(limit=300, query=None, kb_id: int = None):
     }
 
 
-def entity_detail(entity_id: int):
+def entity_detail(entity_id: int, kb_id: int = None):
+    """实体详情。指定 kb_id 时关系只取该知识库内文档产生的，避免多库之间串数据。"""
     conn = get_conn()
     e = conn.execute("SELECT id,name,type,description,mention_count FROM entities WHERE id=?", (entity_id,)).fetchone()
     if not e:
         return None
-    rels = conn.execute(
+    sql = (
         "SELECT r.relation, r.chunk_id, r.inferred, he.name hname, te.name tname "
         "FROM relations r JOIN entities he ON r.head_id=he.id JOIN entities te ON r.tail_id=te.id "
-        "WHERE r.head_id=? OR r.tail_id=? LIMIT 100",
-        (entity_id, entity_id),
-    ).fetchall()
+        "WHERE (r.head_id=? OR r.tail_id=?)"
+    )
+    params = [entity_id, entity_id]
+    if kb_id is not None:
+        sql += " AND r.doc_id IN (SELECT id FROM documents WHERE kb_id=?)"
+        params.append(kb_id)
+    rels = conn.execute(sql + " LIMIT 100", tuple(params)).fetchall()
     return {
         "entity": dict(e),
         "relations": [dict(r) for r in rels],
@@ -813,49 +841,55 @@ def list_chats():
 def delete_chat(chat_id: int):
     with write_lock:
         conn = get_conn()
+        # 反馈是全局学习的：会话删除后其赞/踩不应继续影响后续检索
+        conn.execute("DELETE FROM feedback WHERE chat_id=?", (chat_id,))
         conn.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
         conn.execute("DELETE FROM chats WHERE id=?", (chat_id,))
         conn.commit()
 
 
-def add_message(chat_id: int, role: str, content: str, refs=None) -> int:
+def add_message(chat_id: int, role: str, content: str, refs=None, stats=None) -> int:
     with write_lock:
         conn = get_conn()
         cur = conn.execute(
-            "INSERT INTO messages(chat_id,role,content,refs,created_at) VALUES(?,?,?,?,?)",
-            (chat_id, role, content, json.dumps(refs or [], ensure_ascii=False), time.time()),
+            "INSERT INTO messages(chat_id,role,content,refs,stats,created_at) VALUES(?,?,?,?,?,?)",
+            (chat_id, role, content,
+             json.dumps(refs or [], ensure_ascii=False),
+             json.dumps(stats, ensure_ascii=False) if stats else "",
+             time.time()),
         )
         conn.commit()
         return cur.lastrowid
 
 
+def _parse_message_row(d: dict) -> dict:
+    """refs / stats JSON 字段反序列化（脏数据时回退默认值）。"""
+    try:
+        d["refs"] = json.loads(d.get("refs") or "[]")
+    except Exception:
+        d["refs"] = []
+    try:
+        d["stats"] = json.loads(d["stats"]) if d.get("stats") else None
+    except Exception:
+        d["stats"] = None
+    return d
+
+
 def get_messages(chat_id: int):
     rows = get_conn().execute(
-        "SELECT id,role,content,refs,created_at FROM messages WHERE chat_id=? ORDER BY id", (chat_id,)
+        "SELECT id,role,content,refs,stats,created_at FROM messages WHERE chat_id=? ORDER BY id",
+        (chat_id,),
     ).fetchall()
-    out = []
-    for r in rows:
-        d = dict(r)
-        try:
-            d["refs"] = json.loads(d["refs"] or "[]")
-        except Exception:
-            d["refs"] = []
-        out.append(d)
-    return out
+    return [_parse_message_row(dict(r)) for r in rows]
 
 
 def get_message(message_id: int):
     row = get_conn().execute(
-        "SELECT id,chat_id,role,content,refs FROM messages WHERE id=?", (message_id,)
+        "SELECT id,chat_id,role,content,refs,stats FROM messages WHERE id=?", (message_id,)
     ).fetchone()
     if not row:
         return None
-    d = dict(row)
-    try:
-        d["refs"] = json.loads(d["refs"] or "[]")
-    except Exception:
-        d["refs"] = []
-    return d
+    return _parse_message_row(dict(row))
 
 
 def prev_user_query(chat_id: int, message_id: int) -> str:

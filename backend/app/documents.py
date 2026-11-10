@@ -25,7 +25,15 @@ def extract_text(path: Path) -> str:
                 parts.append(" | ".join(c.text.strip() for c in row.cells))
         return "\n".join(parts)
     if suffix in (".md", ".markdown", ".txt", ""):
-        return path.read_text(encoding="utf-8", errors="ignore")
+        # Windows 记事本保存的文本可能带 UTF-8 BOM 或是 GBK/ANSI 编码。
+        # 直接用 utf-8 读会留下 BOM 字符（污染首个分块与实体名），GBK 文件则整篇乱码。
+        raw = path.read_bytes()
+        if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):   # 带 BOM 的 UTF-16
+            return raw.decode("utf-16", errors="ignore")
+        try:
+            return raw.decode("utf-8-sig")          # utf-8-sig 会自动去掉 BOM
+        except UnicodeDecodeError:
+            return raw.decode("gb18030", errors="ignore")
     raise ValueError(f"不支持的文件类型：{suffix}（支持 pdf/docx/md/txt/png/jpg）")
 
 
@@ -248,9 +256,12 @@ async def process_document(doc_id: int, build_graph: bool = None):
         cfg = config.get_settings()
         if build_graph is None:
             build_graph = cfg.get("graph", {}).get("build_on_upload", True)
+        # 幂等：先清掉该文档可能残留的分块/关系。重复触发解析（例如处理中又点了
+        # 「重解析」）时，否则会把新分块追加到旧分块之后，造成重复入库。
+        db.reset_document_for_reprocess(doc_id)
         db.update_document(doc_id, status="processing", stage="解析文档", error="")
 
-        path = db.UPLOAD_DIR / f"{doc_id}_{doc['filename']}"
+        path = db.UPLOAD_DIR / f"{doc_id}_{Path(doc['filename']).name}"
 
         def on_progress(done, total):
             db.update_document(doc_id, stage=f"OCR 识别 {done}/{total} 页")
@@ -273,8 +284,15 @@ async def process_document(doc_id: int, build_graph: bool = None):
 
         if build_graph:
             db.update_document(doc_id, stage="构建知识图谱")
-            triple_count = await graph.build_graph_for_doc(doc_id)
-            db.update_document(doc_id, triple_count=triple_count)
+            try:
+                triple_count = await graph.build_graph_for_doc(doc_id)
+                db.update_document(doc_id, triple_count=triple_count)
+            except Exception as e:
+                # 分块与向量已入库，图谱失败不应整体判失败：标记完成并留错误说明，
+                # 用户可随后对该文档单独点「建图谱」重试，不必重新解析
+                db.update_document(doc_id, status="done", stage="",
+                                   error=f"文档已入库，但知识图谱构建失败：{str(e)[:300]}")
+                return
 
         db.update_document(doc_id, status="done", stage="")
     except ProviderError as e:
