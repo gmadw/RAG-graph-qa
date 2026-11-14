@@ -1,12 +1,14 @@
-"""SQLite 存储层：文档、分块向量、知识图谱、会话、设置。"""
+"""SQLite 存储层：文档、分块向量、知识图谱、笔记双链、会话、设置。"""
+import os
 import sqlite3
 import json
 import threading
 import time
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
+# 数据目录支持环境变量覆盖：单元测试隔离临时库、容器部署挂载持久卷都靠它。
+DATA_DIR = Path(os.environ.get("RAG_DATA_DIR") or (Path(__file__).resolve().parent.parent / "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR = DATA_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "app.db"
@@ -36,6 +38,8 @@ CREATE TABLE IF NOT EXISTS documents(
   triple_count INTEGER DEFAULT 0,
   embed_tag TEXT DEFAULT '',          -- 向量模型签名（provider/model）
   content_hash TEXT DEFAULT '',       -- 文件内容 SHA256，用于上传去重
+  note_title TEXT DEFAULT '',         -- Obsidian/ Markdown 笔记标题（非笔记为空）
+  note_meta TEXT DEFAULT '',          -- 笔记元信息 JSON：aliases/tags/frontmatter
   created_at REAL
 );
 CREATE TABLE IF NOT EXISTS chunks(
@@ -61,7 +65,21 @@ CREATE TABLE IF NOT EXISTS relations(
   relation TEXT DEFAULT '',
   chunk_id INTEGER,
   doc_id INTEGER,
-  inferred INTEGER DEFAULT 0          -- 1 表示图谱补全推断出的关系（非原文直述）
+  inferred INTEGER DEFAULT 0,         -- 1 表示图谱补全推断出的关系（非原文直述）
+  kind TEXT DEFAULT 'extracted'       -- extracted 抽取 / inferred 推断 / wikilink 笔记双链
+);
+CREATE TABLE IF NOT EXISTS note_links(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  src_doc_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+  dst_title TEXT DEFAULT '',          -- 原始链接目标（不含锚点与展示文本）
+  dst_norm TEXT DEFAULT '',           -- 归一化目标（小写去空白），用于跨笔记解析
+  dst_doc_id INTEGER,                 -- 解析到的目标笔记文档 id，NULL 表示尚未创建
+  kind TEXT DEFAULT 'wikilink',       -- wikilink 普通链接 / embed 嵌入
+  anchor TEXT DEFAULT '',             -- [[笔记#标题]] 的锚点
+  display TEXT DEFAULT '',            -- [[笔记|展示文本]] 的展示文本
+  context TEXT DEFAULT '',            -- 链接所在段落（反链接引文，回答时作为上下文）
+  line_no INTEGER DEFAULT 0,
+  created_at REAL
 );
 CREATE TABLE IF NOT EXISTS feedback(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,6 +121,10 @@ CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm);
 CREATE INDEX IF NOT EXISTS idx_aliases_norm ON entity_aliases(norm);
 CREATE INDEX IF NOT EXISTS idx_relations_head ON relations(head_id);
 CREATE INDEX IF NOT EXISTS idx_relations_tail ON relations(tail_id);
+CREATE INDEX IF NOT EXISTS idx_relations_doc ON relations(doc_id);
+CREATE INDEX IF NOT EXISTS idx_note_links_src ON note_links(src_doc_id);
+CREATE INDEX IF NOT EXISTS idx_note_links_dst ON note_links(dst_doc_id);
+CREATE INDEX IF NOT EXISTS idx_note_links_norm ON note_links(dst_norm);
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id);
 """
 
@@ -139,10 +161,16 @@ def _migrate(conn):
             conn.execute("ALTER TABLE documents ADD COLUMN content_hash TEXT DEFAULT ''")
         if "kb_id" not in cols:
             conn.execute("ALTER TABLE documents ADD COLUMN kb_id INTEGER")
+        if "note_title" not in cols:
+            conn.execute("ALTER TABLE documents ADD COLUMN note_title TEXT DEFAULT ''")
+        if "note_meta" not in cols:
+            conn.execute("ALTER TABLE documents ADD COLUMN note_meta TEXT DEFAULT ''")
     if "relations" in tables:
         rcols = {r["name"] for r in conn.execute("PRAGMA table_info(relations)").fetchall()}
         if "inferred" not in rcols:
             conn.execute("ALTER TABLE relations ADD COLUMN inferred INTEGER DEFAULT 0")
+        if "kind" not in rcols:
+            conn.execute("ALTER TABLE relations ADD COLUMN kind TEXT DEFAULT 'extracted'")
     if "chats" in tables:
         ccols = {r["name"] for r in conn.execute("PRAGMA table_info(chats)").fetchall()}
         if "kb_id" not in ccols:
@@ -297,7 +325,8 @@ def insert_document(filename: str, filetype: str, size: int, content_hash: str =
             (kb_id, filename, filetype, size, "pending", content_hash, time.time()),
         )
         conn.commit()
-        return cur.lastrowid
+    invalidate_search_cache()  # 文档归属映射变化，向量缓存内的 kb 过滤需重建
+    return cur.lastrowid
 
 
 def find_document_by_hash(content_hash: str, kb_id: int = None):
@@ -332,12 +361,12 @@ def update_document(doc_id: int, **fields):
 def list_documents(kb_id: int = None):
     if kb_id is None:
         rows = get_conn().execute(
-            "SELECT id,kb_id,filename,filetype,size,status,stage,error,chunk_count,triple_count,embed_tag,created_at "
+            "SELECT id,kb_id,filename,filetype,size,status,stage,error,chunk_count,triple_count,embed_tag,note_title,created_at "
             "FROM documents ORDER BY id DESC"
         ).fetchall()
     else:
         rows = get_conn().execute(
-            "SELECT id,kb_id,filename,filetype,size,status,stage,error,chunk_count,triple_count,embed_tag,created_at "
+            "SELECT id,kb_id,filename,filetype,size,status,stage,error,chunk_count,triple_count,embed_tag,note_title,created_at "
             "FROM documents WHERE kb_id=? ORDER BY id DESC",
             (kb_id,),
         ).fetchall()
@@ -350,7 +379,10 @@ def get_document(doc_id: int):
 
 
 def clear_doc_relations(doc_id: int):
-    """清空某文档的全部三元组与孤儿实体（用于图谱重建，防止数据叠加）。"""
+    """清空某文档的全部三元组与孤儿实体（用于图谱重建，防止数据叠加）。
+
+    笔记双链边（kind='wikilink'）也一并清掉，随后由 notes.link_notes 重建。
+    """
     with write_lock:
         conn = get_conn()
         conn.execute("DELETE FROM relations WHERE doc_id=?", (doc_id,))
@@ -372,6 +404,8 @@ def reset_document_for_reprocess(doc_id: int):
         )
         conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
         conn.execute("DELETE FROM relations WHERE doc_id=?", (doc_id,))
+        # 重新解析会重新生成出链；入链（别的笔记指向本笔记）保留，重解析后仍然有效
+        conn.execute("DELETE FROM note_links WHERE src_doc_id=?", (doc_id,))
         conn.execute(
             "DELETE FROM entities WHERE id NOT IN "
             "(SELECT head_id FROM relations UNION SELECT tail_id FROM relations)"
@@ -382,6 +416,7 @@ def reset_document_for_reprocess(doc_id: int):
             (doc_id,),
         )
         conn.commit()
+    invalidate_search_cache()
 
 
 def delete_document(doc_id: int):
@@ -396,12 +431,17 @@ def delete_document(doc_id: int):
         )
         conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
         conn.execute("DELETE FROM relations WHERE doc_id=?", (doc_id,))
+        # 只删「本笔记作为源」的链接；指向本笔记的链接记录保留但解除绑定，
+        # 这样重新上传同名笔记后能自动恢复反链接，不会留下悬空外键。
+        conn.execute("DELETE FROM note_links WHERE src_doc_id=?", (doc_id,))
+        conn.execute("UPDATE note_links SET dst_doc_id=NULL WHERE dst_doc_id=?", (doc_id,))
         conn.execute(
             "DELETE FROM entities WHERE id NOT IN "
             "(SELECT head_id FROM relations UNION SELECT tail_id FROM relations)"
         )
         conn.execute("DELETE FROM documents WHERE id=?", (doc_id,))
         conn.commit()
+    invalidate_search_cache()
     # 同步删除 uploads 下的原始文件，否则删除文档/知识库后文件会永久残留
     if filename:
         try:
@@ -420,35 +460,75 @@ def insert_chunks(doc_id: int, embed_tag: str, items):
                 (doc_id, idx, text, vec.tobytes() if vec is not None else None, embed_tag),
             )
         conn.commit()
+    invalidate_search_cache()
+
+
+# ---------------- 向量矩阵缓存 ----------------
+# all_vectors 要从 SQLite 读出全部分块 BLOB 再拼矩阵，2 万分块约 80ms 且随规模线性增长，
+# 而检索是最高频的读路径。进程内按 embed_tag 缓存矩阵（2 万 × 256 维 float32 ≈ 20MB），
+# chunks/documents 发生增删时由写路径主动失效，下次检索自动重建。
+_VECTOR_CACHE = {}   # embed_tag -> (ids: np.ndarray, texts: list, docs: np.ndarray, mat: np.ndarray)
+_DOC_KB = None       # doc_id -> kb_id 映射（随 documents 增删失效）
+
+
+def invalidate_search_cache():
+    """向量矩阵与文档归属映射已过期（chunks/documents 增删后调用）。"""
+    global _DOC_KB
+    _VECTOR_CACHE.clear()
+    _DOC_KB = None
+
+
+def _doc_kb_map():
+    global _DOC_KB
+    if _DOC_KB is None:
+        rows = get_conn().execute("SELECT id, kb_id FROM documents").fetchall()
+        _DOC_KB = {r["id"]: r["kb_id"] for r in rows}
+    return _DOC_KB
 
 
 def all_vectors(embed_tag: str, kb_id: int = None):
     """返回 (ids, texts, docs, matrix)。仅加载与当前向量模型签名一致的块。
-    指定 kb_id 时只加载该知识库下文档的分块，实现知识隔离。"""
+
+    embed_tag 过滤必须下推到 SQL：此前在 Python 侧过滤会把换模型前的历史向量
+    也整表读出来再丢弃，多模型历史的库检索一次能拖到数百毫秒。
+    指定 kb_id 时在缓存矩阵内按文档归属过滤，实现知识隔离。
+    """
     import numpy as np
+    cached = _VECTOR_CACHE.get(embed_tag)
+    if cached is None:
+        rows = get_conn().execute(
+            "SELECT id, text, doc_id, vector FROM chunks "
+            "WHERE vector IS NOT NULL AND embed_tag=?",
+            (embed_tag,),
+        ).fetchall()
+        if not rows:
+            return [], [], [], None
+        dim = len(np.frombuffer(rows[0]["vector"], dtype=np.float32))
+        n = len(rows)
+        ids = np.empty(n, dtype=np.int64)
+        docs = np.empty(n, dtype=np.int64)
+        mat = np.empty((n, dim), dtype=np.float32)
+        texts = [None] * n
+        for i, r in enumerate(rows):
+            ids[i] = r["id"]
+            docs[i] = r["doc_id"]
+            texts[i] = r["text"]
+            mat[i] = np.frombuffer(r["vector"], dtype=np.float32)
+        cached = (ids, texts, docs, mat)
+        _VECTOR_CACHE[embed_tag] = cached
+    ids, texts, docs, mat = cached
     if kb_id is None:
-        rows = get_conn().execute(
-            "SELECT c.id, c.text, c.doc_id, c.vector, c.embed_tag FROM chunks c "
-            "WHERE c.vector IS NOT NULL"
-        ).fetchall()
-    else:
-        rows = get_conn().execute(
-            "SELECT c.id, c.text, c.doc_id, c.vector, c.embed_tag FROM chunks c "
-            "JOIN documents d ON c.doc_id=d.id "
-            "WHERE c.vector IS NOT NULL AND d.kb_id=?",
-            (kb_id,),
-        ).fetchall()
-    rows = [r for r in rows if r["embed_tag"] == embed_tag]
-    if not rows:
+        return ids, texts, docs, mat
+    doc_kb = _doc_kb_map()
+    idx = np.nonzero(np.array([doc_kb.get(int(d)) == kb_id for d in docs], dtype=bool))[0]
+    if idx.size == 0:
         return [], [], [], None
-    ids = [r["id"] for r in rows]
-    texts = [r["text"] for r in rows]
-    docs = [r["doc_id"] for r in rows]
-    dim = len(np.frombuffer(rows[0]["vector"], dtype=np.float32))
-    mat = np.zeros((len(rows), dim), dtype=np.float32)
-    for i, r in enumerate(rows):
-        mat[i] = np.frombuffer(r["vector"], dtype=np.float32)
-    return ids, texts, docs, mat
+    return (
+        ids[idx],
+        [texts[i] for i in idx],
+        docs[idx],
+        mat[idx],
+    )
 
 
 # ---------------- knowledge graph ----------------
@@ -482,15 +562,36 @@ def upsert_entity(name: str, etype: str) -> int:
 
 
 def insert_relation(head_id: int, tail_id: int, relation: str, chunk_id: int, doc_id: int,
-                    inferred: int = 0):
+                    inferred: int = 0, kind: str = ""):
+    """插入三元组。kind 未指定时按 inferred 推断为 extracted / inferred。"""
+    kind = kind or ("inferred" if inferred else "extracted")
     with write_lock:
         conn = get_conn()
         conn.execute(
-            "INSERT INTO relations(head_id,tail_id,relation,chunk_id,doc_id,inferred) "
-            "VALUES(?,?,?,?,?,?)",
-            (head_id, tail_id, relation, chunk_id, doc_id, 1 if inferred else 0),
+            "INSERT INTO relations(head_id,tail_id,relation,chunk_id,doc_id,inferred,kind) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (head_id, tail_id, relation, chunk_id, doc_id, 1 if inferred else 0, kind),
         )
         conn.commit()
+
+
+def insert_relations_bulk(items):
+    """批量插入三元组（单事务）。
+
+    笔记双链重建时可能有上千条边，逐条 commit 会让批量导入笔记明显变慢。
+    items: [(head_id, tail_id, relation, chunk_id, doc_id, kind)]
+    """
+    if not items:
+        return 0
+    with write_lock:
+        conn = get_conn()
+        conn.executemany(
+            "INSERT INTO relations(head_id,tail_id,relation,chunk_id,doc_id,inferred,kind) "
+            "VALUES(?,?,?,?,?,0,?)",
+            items,
+        )
+        conn.commit()
+    return len(items)
 
 
 def find_entity_by_name(name: str):
@@ -524,6 +625,315 @@ def delete_doc_chunks(doc_id: int):
     with write_lock:
         conn = get_conn()
         conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+        conn.commit()
+    invalidate_search_cache()
+
+
+# ---------------- Obsidian 笔记与双链 ----------------
+
+_NOTE_EXT = (".md", ".markdown")
+
+
+def note_norm(name: str) -> str:
+    """笔记链接归一化：去 .md 后缀、去首尾空白、压缩连续空白、统一小写。
+
+    Obsidian 的 `[[笔记名]]` 不带扩展名，而文件名可能带 .md；两者必须归一到同一键，
+    否则「先传 A 后传 B」时 A 里指向 B 的链接永远解析不到。
+    """
+    n = (name or "").strip().replace("\\", "/").split("/")[-1]
+    for ext in _NOTE_EXT:
+        if n.lower().endswith(ext):
+            n = n[: -len(ext)]
+            break
+    return " ".join(n.split()).lower()
+
+
+def set_note_meta(doc_id: int, title: str, aliases=None, tags=None, frontmatter=None):
+    """写入笔记标题与元信息（别名/标签/frontmatter）。"""
+    meta = {
+        "aliases": [str(a).strip() for a in (aliases or []) if str(a).strip()],
+        "tags": [str(t).strip().lstrip("#") for t in (tags or []) if str(t).strip()],
+        "frontmatter": frontmatter or {},
+    }
+    with write_lock:
+        conn = get_conn()
+        conn.execute(
+            "UPDATE documents SET note_title=?, note_meta=? WHERE id=?",
+            ((title or "").strip()[:200], json.dumps(meta, ensure_ascii=False), doc_id),
+        )
+        conn.commit()
+
+
+def get_note_meta(doc_id: int) -> dict:
+    row = get_conn().execute(
+        "SELECT id,kb_id,filename,note_title,note_meta FROM documents WHERE id=?", (doc_id,)
+    ).fetchone()
+    if not row:
+        return {}
+    try:
+        meta = json.loads(row["note_meta"] or "{}")
+    except Exception:
+        meta = {}
+    return {
+        "doc_id": row["id"],
+        "kb_id": row["kb_id"],
+        "filename": row["filename"],
+        "title": row["note_title"] or "",
+        "aliases": meta.get("aliases") or [],
+        "tags": meta.get("tags") or [],
+        "frontmatter": meta.get("frontmatter") or {},
+    }
+
+
+def replace_note_links(doc_id: int, links):
+    """以本次解析结果整体替换某笔记的出链（幂等，重解析不会累加）。
+
+    links: [{target, anchor, display, kind, context, line_no}]
+    """
+    with write_lock:
+        conn = get_conn()
+        conn.execute("DELETE FROM note_links WHERE src_doc_id=?", (doc_id,))
+        now = time.time()
+        for ln in links or []:
+            target = (ln.get("target") or "").strip()
+            if not target:
+                continue
+            conn.execute(
+                "INSERT INTO note_links(src_doc_id,dst_title,dst_norm,kind,anchor,display,context,line_no,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    doc_id,
+                    target[:200],
+                    note_norm(target),
+                    (ln.get("kind") or "wikilink")[:20],
+                    (ln.get("anchor") or "")[:200],
+                    (ln.get("display") or "")[:200],
+                    (ln.get("context") or "")[:500],
+                    int(ln.get("line_no") or 0),
+                    now,
+                ),
+            )
+        conn.commit()
+
+
+def note_norm_map(kb_id: int = None) -> dict:
+    """笔记标题与别名 → 文档 id 的映射。
+
+    同名笔记冲突时保留先创建的（setdefault），避免后上传的笔记把既有反链接整体吸走。
+    """
+    if kb_id is None:
+        rows = get_conn().execute(
+            "SELECT id,note_title,note_meta FROM documents WHERE note_title!='' ORDER BY id"
+        ).fetchall()
+    else:
+        rows = get_conn().execute(
+            "SELECT id,note_title,note_meta FROM documents "
+            "WHERE note_title!='' AND kb_id=? ORDER BY id",
+            (kb_id,),
+        ).fetchall()
+    out = {}
+    for r in rows:
+        out.setdefault(note_norm(r["note_title"]), r["id"])
+        try:
+            meta = json.loads(r["note_meta"] or "{}")
+        except Exception:
+            meta = {}
+        for alias in meta.get("aliases") or []:
+            key = note_norm(alias)
+            if key:
+                out.setdefault(key, r["id"])
+    return out
+
+
+def resolve_note_links(kb_id: int = None) -> int:
+    """把未解析的双链目标绑定到实际笔记文档，返回本次新解析成功的链接数。
+
+    上传顺序不确定（A 链接 B，但 A 先入库），因此每次入库后都要重跑一遍全量解析。
+    """
+    norm_map = note_norm_map(kb_id)
+    if not norm_map:
+        return 0
+    with write_lock:
+        conn = get_conn()
+        if kb_id is None:
+            rows = conn.execute(
+                "SELECT id,dst_norm FROM note_links WHERE dst_doc_id IS NULL"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT l.id,l.dst_norm FROM note_links l JOIN documents d ON d.id=l.src_doc_id "
+                "WHERE l.dst_doc_id IS NULL AND d.kb_id=?",
+                (kb_id,),
+            ).fetchall()
+        fixed = 0
+        for r in rows:
+            dst = norm_map.get(r["dst_norm"])
+            if dst:
+                conn.execute("UPDATE note_links SET dst_doc_id=? WHERE id=?", (dst, r["id"]))
+                fixed += 1
+        conn.commit()
+    return fixed
+
+
+def note_backlinks(doc_id: int, limit: int = 20):
+    """指向该笔记的链接（反链接），带链接所在段落作为引文上下文。"""
+    rows = get_conn().execute(
+        "SELECT l.id, l.src_doc_id, l.anchor, l.display, l.context, l.line_no, l.kind, "
+        "       d.note_title AS src_title, d.filename AS src_filename "
+        "FROM note_links l JOIN documents d ON d.id=l.src_doc_id "
+        "WHERE l.dst_doc_id=? ORDER BY l.id LIMIT ?",
+        (doc_id, limit),
+    ).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "doc_id": r["src_doc_id"],
+            "title": r["src_title"] or r["src_filename"],
+            "filename": r["src_filename"],
+            "anchor": r["anchor"],
+            "display": r["display"],
+            "context": r["context"],
+            "line_no": r["line_no"],
+            "kind": r["kind"],
+        })
+    return out
+
+
+def note_outlinks(doc_id: int, limit: int = 50):
+    """该笔记指向其他笔记的链接（出链），同时标记是否已解析。"""
+    rows = get_conn().execute(
+        "SELECT l.id, l.dst_title, l.dst_doc_id, l.anchor, l.display, l.kind, l.line_no, "
+        "       d.note_title AS dst_doc_title "
+        "FROM note_links l LEFT JOIN documents d ON d.id=l.dst_doc_id "
+        "WHERE l.src_doc_id=? ORDER BY l.id LIMIT ?",
+        (doc_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def notes_in_kb(kb_id: int = None):
+    """知识库内的笔记列表（按入链数降序，体现「被引用最多」的知识节点）。"""
+    if kb_id is None:
+        rows = get_conn().execute(
+            "SELECT d.id AS doc_id, d.note_title, d.filename, d.note_meta, d.status, "
+            " (SELECT COUNT(*) FROM note_links l WHERE l.src_doc_id=d.id) AS outlinks, "
+            " (SELECT COUNT(*) FROM note_links l WHERE l.dst_doc_id=d.id) AS inlinks "
+            "FROM documents d WHERE d.note_title!='' ORDER BY inlinks DESC, d.id"
+        ).fetchall()
+    else:
+        rows = get_conn().execute(
+            "SELECT d.id AS doc_id, d.note_title, d.filename, d.note_meta, d.status, "
+            " (SELECT COUNT(*) FROM note_links l WHERE l.src_doc_id=d.id) AS outlinks, "
+            " (SELECT COUNT(*) FROM note_links l WHERE l.dst_doc_id=d.id) AS inlinks "
+            "FROM documents d WHERE d.note_title!='' AND d.kb_id=? ORDER BY inlinks DESC, d.id",
+            (kb_id,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            meta = json.loads(r["note_meta"] or "{}")
+        except Exception:
+            meta = {}
+        out.append({
+            "doc_id": r["doc_id"],
+            "title": r["note_title"],
+            "filename": r["filename"],
+            "status": r["status"],
+            "tags": meta.get("tags") or [],
+            "aliases": meta.get("aliases") or [],
+            "inlinks": r["inlinks"],
+            "outlinks": r["outlinks"],
+        })
+    return out
+
+
+def unresolved_links(kb_id: int = None, limit: int = 50):
+    """指向「尚不存在笔记」的链接（Obsidian 里显示为未创建节点）。"""
+    if kb_id is None:
+        rows = get_conn().execute(
+            "SELECT l.id,l.dst_title,d.note_title AS src_title,d.id AS src_doc_id "
+            "FROM note_links l JOIN documents d ON d.id=l.src_doc_id "
+            "WHERE l.dst_doc_id IS NULL ORDER BY l.id LIMIT ?",
+            (limit,),
+        ).fetchall()
+    else:
+        rows = get_conn().execute(
+            "SELECT l.id,l.dst_title,d.note_title AS src_title,d.id AS src_doc_id "
+            "FROM note_links l JOIN documents d ON d.id=l.src_doc_id "
+            "WHERE l.dst_doc_id IS NULL AND d.kb_id=? ORDER BY l.id LIMIT ?",
+            (kb_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def note_link_stats(kb_id: int = None) -> dict:
+    """笔记与双链规模统计（前端图谱页展示「知识连接度」）。"""
+    conn = get_conn()
+    if kb_id is None:
+        notes = conn.execute("SELECT COUNT(*) c FROM documents WHERE note_title!=''").fetchone()["c"]
+        links = conn.execute("SELECT COUNT(*) c FROM note_links").fetchone()["c"]
+        resolved = conn.execute(
+            "SELECT COUNT(*) c FROM note_links WHERE dst_doc_id IS NOT NULL"
+        ).fetchone()["c"]
+    else:
+        notes = conn.execute(
+            "SELECT COUNT(*) c FROM documents WHERE note_title!='' AND kb_id=?", (kb_id,)
+        ).fetchone()["c"]
+        links = conn.execute(
+            "SELECT COUNT(*) c FROM note_links l JOIN documents d ON d.id=l.src_doc_id WHERE d.kb_id=?",
+            (kb_id,),
+        ).fetchone()["c"]
+        resolved = conn.execute(
+            "SELECT COUNT(*) c FROM note_links l JOIN documents d ON d.id=l.src_doc_id "
+            "WHERE l.dst_doc_id IS NOT NULL AND d.kb_id=?",
+            (kb_id,),
+        ).fetchone()["c"]
+    return {
+        "notes": notes,
+        "links": links,
+        "resolved": resolved,
+        "unresolved": max(0, links - resolved),
+    }
+
+
+def note_chunks(doc_id: int, limit: int = 3):
+    """笔记的前若干分块文本（反链接上下文与回答引用用）。"""
+    rows = get_conn().execute(
+        "SELECT id,chunk_index,text FROM chunks WHERE doc_id=? ORDER BY chunk_index LIMIT ?",
+        (doc_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def chunk_id_for_text(doc_id: int, needle: str):
+    """在文档分块里定位包含指定文本的块，用于把笔记链接边关联回原文（引用溯源）。"""
+    if not needle:
+        return None
+    escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    row = get_conn().execute(
+        "SELECT id FROM chunks WHERE doc_id=? AND text LIKE ? ESCAPE '\\' "
+        "ORDER BY chunk_index LIMIT 1",
+        (doc_id, f"%{escaped}%"),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def clear_wikilink_relations(kb_id: int = None):
+    """清空双链边（重建链接前调用），并清理因此产生的孤儿笔记实体。"""
+    with write_lock:
+        conn = get_conn()
+        if kb_id is None:
+            conn.execute("DELETE FROM relations WHERE kind='wikilink'")
+        else:
+            conn.execute(
+                "DELETE FROM relations WHERE kind='wikilink' AND doc_id IN "
+                "(SELECT id FROM documents WHERE kb_id=?)",
+                (kb_id,),
+            )
+        conn.execute(
+            "DELETE FROM entities WHERE id NOT IN "
+            "(SELECT head_id FROM relations UNION SELECT tail_id FROM relations)"
+        )
         conn.commit()
 
 
@@ -608,6 +1018,19 @@ def update_entity_description(entity_id: int, description: str):
         conn.commit()
 
 
+def set_entity_description_if_empty(entity_id: int, description: str):
+    """只在实体尚无描述时写入（笔记首段兜底描述，不覆盖 LLM 生成的摘要）。"""
+    if not (description or "").strip():
+        return
+    with write_lock:
+        conn = get_conn()
+        conn.execute(
+            "UPDATE entities SET description=? WHERE id=? AND (description IS NULL OR description='')",
+            (description.strip()[:500], entity_id),
+        )
+        conn.commit()
+
+
 def doc_entity_ids(doc_id: int, limit: int = 200) -> list:
     """某文档图谱涉及的全部实体 id。"""
     rows = get_conn().execute(
@@ -645,6 +1068,27 @@ def entity_evidence(entity_id: int, limit: int = 5) -> list:
                 seen.add(r["id"])
                 texts.append(r["text"][:400])
     return texts[:limit]
+
+
+def top_entity_ids(kb_id: int = None, limit: int = 5) -> list:
+    """图上最活跃的实体 id（按提及次数）。用于无明确问题时给图谱解读一个起点。"""
+    if kb_id is None:
+        rows = get_conn().execute(
+            "SELECT id FROM entities WHERE id IN "
+            "(SELECT head_id FROM relations UNION SELECT tail_id FROM relations) "
+            "ORDER BY mention_count DESC, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+    else:
+        sub = "(SELECT id FROM documents WHERE kb_id=?)"
+        rows = get_conn().execute(
+            "SELECT id FROM entities WHERE id IN ("
+            "  SELECT head_id FROM relations WHERE doc_id IN " + sub +
+            "  UNION SELECT tail_id FROM relations WHERE doc_id IN " + sub +
+            ") ORDER BY mention_count DESC, id LIMIT ?",
+            (kb_id, kb_id, limit),
+        ).fetchall()
+    return [r["id"] for r in rows]
 
 
 def graph_stats(kb_id: int = None):
@@ -721,13 +1165,13 @@ def graph_data(limit=300, query=None, kb_id: int = None):
 
     if kb_id is None:
         links = conn.execute(
-            f"SELECT head_id,tail_id,relation,inferred FROM relations "
+            f"SELECT head_id,tail_id,relation,inferred,kind FROM relations "
             f"WHERE head_id IN ({marks}) AND tail_id IN ({marks}) LIMIT 1500",
             tuple(ent_ids) * 2,
         ).fetchall()
     else:
         links = conn.execute(
-            f"SELECT head_id,tail_id,relation,inferred FROM relations "
+            f"SELECT head_id,tail_id,relation,inferred,kind FROM relations "
             f"WHERE head_id IN ({marks}) AND tail_id IN ({marks}) "
             f"AND doc_id IN {sub} LIMIT 1500",
             tuple(ent_ids) * 2 + (kb_id,),
@@ -758,6 +1202,7 @@ def graph_data(limit=300, query=None, kb_id: int = None):
             "source": ent_map[l["head_id"]]["name"],
             "target": ent_map[l["tail_id"]]["name"],
             "value": l["relation"],
+            "kind": l["kind"] or "extracted",
             # 推断关系用紫色虚线区分
             **({"lineStyle": {"type": "dashed", "color": "#a78bfa"}} if l["inferred"] else {}),
         }

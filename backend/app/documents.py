@@ -245,8 +245,8 @@ def chunk_text(text: str, target: int = 500, overlap_reserved: bool = True) -> l
 
 
 async def process_document(doc_id: int, build_graph: bool = None):
-    """后台任务：解析（含 OCR）→ 分块 → 向量化入库 →（可选）图谱构建。"""
-    from . import config, graph
+    """后台任务：解析（含 OCR）→ 笔记双链解析 → 分块 → 向量化入库 →（可选）图谱构建。"""
+    from . import config, graph, notes
     from .providers import embed_texts, ProviderError
 
     doc = db.get_document(doc_id)
@@ -267,10 +267,23 @@ async def process_document(doc_id: int, build_graph: bool = None):
             db.update_document(doc_id, stage=f"OCR 识别 {done}/{total} 页")
 
         text, note = await extract_any(path, cfg, on_progress=on_progress)
-        chunks = chunk_text(text)
+
+        # Obsidian 风格 Markdown：解析 frontmatter / 双链 / 标签。
+        # frontmatter 只作为元信息，不进正文分块（否则 YAML 头会污染向量与引用展示）；
+        # 标题会补进首个分块，避免「查询里只写笔记名、正文没出现标题」导致召回失败。
+        note_info = None
+        body = text
+        if notes.is_note(path):
+            _fm, body = notes.parse_frontmatter(text)
+            # 原始文件名而非磁盘路径：磁盘文件名带 {doc_id}_ 前缀
+            note_info = notes.sync_note(doc_id, path, text, body=body, source_name=doc["filename"])
+
+        chunks = chunk_text(body)
         if not chunks:
             db.update_document(doc_id, status="error", stage="", error="未能从文档中提取到文本")
             return
+        if note_info and note_info.get("title") and not body.lstrip().startswith("#"):
+            chunks[0] = f"# {note_info['title']}\n{chunks[0]}"
 
         db.update_document(
             doc_id, stage=f"向量化 {len(chunks)} 个分块" + (f"（{note}）" if note else "")

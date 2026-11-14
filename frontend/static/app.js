@@ -333,10 +333,12 @@ function scrollChat(force = false) {
   if (force || nearBottom) box.scrollTop = box.scrollHeight;
 }
 
-function showRefs(msgEl, refs, triples = [], entities = [], searchQuery = null, web = null) {
+function showRefs(msgEl, refs, triples = [], entities = [], searchQuery = null, web = null, extra = null) {
   const panel = msgEl.querySelector(".refs-panel");
   const webInfo = !!(web && web.enabled);
-  if ((!refs || !refs.length) && !triples.length && !webInfo) return;
+  const narrative = (extra && extra.narrative) || "";
+  const noteCtx = (extra && extra.notes) || "";
+  if ((!refs || !refs.length) && !triples.length && !webInfo && !narrative && !noteCtx) return;
   let html = "";
   if (webInfo) {
     html += web.error
@@ -348,6 +350,14 @@ function showRefs(msgEl, refs, triples = [], entities = [], searchQuery = null, 
   }
   if (searchQuery) {
     html += `<div class="rp-line">检索词（已做多轮指代消解）：<b>${escapeHtml(searchQuery)}</b></div>`;
+  }
+  if (narrative) {
+    html += `<details class="graph-read"><summary class="rp-title">图谱解读（AI 读到的结构）</summary>` +
+      `<div style="white-space:pre-wrap;font-size:12px;line-height:1.75;color:var(--text-2);margin-top:6px">${escapeHtml(narrative)}</div></details>`;
+  }
+  if (noteCtx) {
+    html += `<details class="graph-read"><summary class="rp-title">笔记链接（反链接与知识网络）</summary>` +
+      `<div style="white-space:pre-wrap;font-size:12px;line-height:1.75;color:var(--text-2);margin-top:6px">${escapeHtml(noteCtx)}</div></details>`;
   }
   if (refs && refs.length) {
     html += `<div class="rp-title">引用来源（${refs.length}）</div>`;
@@ -393,6 +403,21 @@ async function sendQuery() {
   let acc = "";
   let statsData = null;
   let firstDeltaAt = null;
+  /* 流式渲染合并：SSE 每 token 一次 delta，直接 innerHTML 全量重渲是 O(n²) 成本，
+     长回答会越写越卡。用 rAF 把同一帧内的多个 delta 合并成一次渲染。 */
+  let renderQueued = false;
+  function flushRender() {
+    renderQueued = false;
+    if (seq !== sendSeq) return;  // 已切到其他会话：丢弃积压渲染，防止旧内容闪回
+    contentEl.innerHTML = renderMd(acc);
+    updateLiveUsage(botEl, acc, firstDeltaAt);
+    scrollChat();
+  }
+  function queueRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(flushRender);
+  }
   const seq = ++sendSeq;
   const controller = new AbortController();
   currentAbort = controller;
@@ -432,13 +457,12 @@ async function sendQuery() {
         let data = {};
         try { data = JSON.parse(dataMatch[1]); } catch (e) {}
         if (ev === "meta") {
-          showRefs(botEl, data.refs, data.graph_triples, data.graph_entities, data.search_query, data.web);
+          showRefs(botEl, data.refs, data.graph_triples, data.graph_entities, data.search_query, data.web,
+            { narrative: data.graph_narrative, paths: data.graph_paths, notes: data.notes });
         } else if (ev === "delta") {
           if (firstDeltaAt === null) firstDeltaAt = performance.now();
           acc += data.text;
-          contentEl.innerHTML = renderMd(acc);
-          updateLiveUsage(botEl, acc, firstDeltaAt);
-          scrollChat();
+          queueRender();
         } else if (ev === "stats") {
           statsData = data;
           showUsage(botEl, data);
@@ -591,14 +615,18 @@ async function loadDocs() {
       pending: '<span class="badge pending"><i class="dot"></i>等待中</span>',
       error: `<span class="badge error"><i class="dot"></i>失败</span>`,
     };
+    const noteBadge = d.note_title
+      ? `<span class="note-badge" title="Markdown 笔记标题（双链解析依据）">[[${escapeHtml(d.note_title)}]]</span>`
+      : "";
     tr.innerHTML = `
-      <td class="doc-name" title="${escapeHtml(d.filename)}">${escapeHtml(d.filename)}</td>
+      <td class="doc-name" title="${escapeHtml(d.filename)}">${noteBadge}${escapeHtml(d.filename)}</td>
       <td class="num">${fmtSize(d.size)}</td>
       <td>${statusMap[d.status] || d.status}${d.error ? `<div class="err-tip" title="${escapeHtml(d.error)}">${escapeHtml(d.error)}</div>` : ""}</td>
       <td class="num">${d.chunk_count || "-"}</td>
       <td class="num">${d.triple_count || "-"}</td>
       <td style="font-size:11px;color:var(--muted)">${escapeHtml((d.embed_tag || "").split("::")[1] || "-")}</td>
       <td class="actions">
+        ${d.note_title ? `<button class="small" data-act="links" data-id="${d.id}" title="查看反链接与出链">双链</button>` : ""}
         <button class="small" data-act="reparse" data-id="${d.id}" title="清空分块后重新解析（启用 OCR 后可识别扫描件）">重解析</button>
         <button class="small" data-act="graph" data-id="${d.id}" ${d.status !== "done" ? "disabled" : ""} title="重新用 LLM 抽取实体关系">建图谱</button>
         <button class="small danger" data-act="del" data-id="${d.id}">删除</button>
@@ -613,12 +641,80 @@ async function loadDocs() {
   if (hasProcessing) docsTimer = setTimeout(loadDocs, 2000);
 }
 
+/* ---------- 笔记双链：反链接面板 + 存量补解析 ---------- */
+async function openNoteLinks(docId) {
+  const panel = $("#note-panel");
+  $("#note-panel-title").textContent = "加载中…";
+  $("#note-panel-meta").textContent = "";
+  $("#note-panel-body").innerHTML = "";
+  panel.classList.add("show");
+  let d;
+  try {
+    d = await api(`/api/notes/${docId}/backlinks`);
+  } catch (e) {
+    $("#note-panel-title").textContent = "读取失败";
+    $("#note-panel-body").innerHTML = `<div class="note-empty">${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  $("#note-panel-title").textContent = `《${d.meta.title || d.meta.filename}》`;
+  const meta = [];
+  if (d.meta.tags && d.meta.tags.length) meta.push("标签 " + d.meta.tags.map((t) => "#" + t).join(" "));
+  if (d.meta.aliases && d.meta.aliases.length) meta.push("别名 " + d.meta.aliases.join("、"));
+  $("#note-panel-meta").textContent = meta.join(" · ") || "Markdown 笔记";
+
+  let html = "";
+  if (d.backlinks && d.backlinks.length) {
+    html += `<div class="note-sec"><h4>反向链接（${d.backlinks.length}）：谁引用了本笔记</h4>` +
+      d.backlinks.map((b) => `<div class="note-item"><span class="src">《${escapeHtml(b.title)}》</span>` +
+        (b.anchor ? `（锚点：${escapeHtml(b.anchor)}）` : "") +
+        (b.context ? `<div class="quote">${escapeHtml(b.context)}</div>` : "") + `</div>`).join("") +
+      `</div>`;
+  } else {
+    html += `<div class="note-sec"><h4>反向链接</h4><div class="note-empty">暂无其他笔记引用它；上传引用本笔记的 Markdown 后会自动出现</div></div>`;
+  }
+  if (d.outlinks && d.outlinks.length) {
+    html += `<div class="note-sec"><h4>出链（${d.outlinks.length}）：本笔记指向</h4>` +
+      d.outlinks.map((o) => `<div class="note-item"><span class="src">` +
+        (o.dst_doc_title ? `《${escapeHtml(o.dst_doc_title)}》` : escapeHtml(o.dst_title)) + `</span>` +
+        (o.dst_doc_id ? "" : ` <span style="color:var(--yellow)">尚未创建</span>`) +
+        (o.anchor ? ` <span class="quote">#${escapeHtml(o.anchor)}</span>` : "") + `</div>`).join("") +
+      `</div>`;
+  }
+  $("#note-panel-body").innerHTML = html;
+}
+$("#note-panel-close").addEventListener("click", () => $("#note-panel").classList.remove("show"));
+
+// 存量补解析：升级前上传的 .md 没有 note_title，点一次即可补齐双链（不重新向量化）
+$("#btn-notes").addEventListener("click", async () => {
+  const btn = $("#btn-notes");
+  btn.disabled = true;
+  btn.textContent = "解析中…";
+  try {
+    const r = await api("/api/notes/relink", {
+      method: "POST",
+      body: JSON.stringify({ kb_id: currentKbId }),
+    });
+    toast(`双链已重建：补解析 ${r.backfilled} 篇笔记，解析 ${r.resolved} 条链接，图谱边 ${r.edges} 条`);
+    await loadDocs();
+    loadKbStatus();
+  } catch (e) {
+    toast(e.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "笔记双链";
+  }
+});
+
 tbodyEvents();
 function tbodyEvents() {
   $("#docs-tbody").addEventListener("click", async (e) => {
     const btn = e.target.closest("button");
     if (!btn || btn.disabled) return;
     const id = btn.dataset.id;
+    if (btn.dataset.act === "links") {
+      openNoteLinks(id);
+      return;
+    }
     if (btn.dataset.act === "del") {
       if (!confirm("删除该文档及其全部分块与图谱关系？")) return;
       try {
@@ -697,25 +793,59 @@ async function handleFiles(files) {
 /* ================= 知识图谱 ================= */
 let graphInited = false;
 
+/* ECharts（约 1MB）只有图谱视图用得到，首屏不加载：
+   切到图谱视图时才注入 <script>，重复调用复用同一个加载 Promise。 */
+let echartsPromise = null;
+function loadECharts() {
+  if (window.echarts) return Promise.resolve();
+  if (!echartsPromise) {
+    echartsPromise = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "/static/echarts.min.js";
+      s.onload = () => resolve();
+      s.onerror = () => {
+        echartsPromise = null;  // 允许网络恢复后重试
+        reject(new Error("图表库 echarts.min.js 加载失败，请刷新重试"));
+      };
+      document.head.appendChild(s);
+    });
+  }
+  return echartsPromise;
+}
+
 async function initGraph() {
   if (!graphChart) {
+    try {
+      await loadECharts();
+    } catch (e) {
+      $("#graph-stats").innerHTML = `<span style="color:var(--yellow)">${escapeHtml(e.message)}</span>`;
+      return;
+    }
     graphChart = echarts.init($("#graph-chart"));
     graphChart.on("click", (params) => {
       if (params.dataType === "node") openEntity(params.data.id);
     });
-    window.addEventListener("resize", () => graphChart && graphChart.resize());
+    // resize 高频触发，每帧合并一次；直接调会强制同步重排
+    let resizeRaf = 0;
+    window.addEventListener("resize", () => {
+      cancelAnimationFrame(resizeRaf);
+      resizeRaf = requestAnimationFrame(() => graphChart && graphChart.resize());
+    });
   }
   graphChart.resize();
   await refreshGraph();
 }
 
 async function refreshGraph(q = "") {
+  if (!graphChart) return;  // 图表库尚未加载成功时（如 initGraph 失败），直接跳过渲染
   const kbq = currentKbId != null ? "&kb_id=" + currentKbId : "";
   const [stats, data] = await Promise.all([
     api("/api/graph/stats" + (currentKbId != null ? "?kb_id=" + currentKbId : "")),
     api("/api/graph?limit=300" + (q ? "&q=" + encodeURIComponent(q) : "") + kbq),
   ]);
-  $("#graph-stats").innerHTML = `${escapeHtml(kbNameOf(currentKbId))} · 实体 ${stats.entities} · 关系 ${stats.relations}` + (q ? ` · 筛选"${escapeHtml(q)}"` : "");
+  $("#graph-stats").innerHTML = `${escapeHtml(kbNameOf(currentKbId))} · 实体 ${stats.entities} · 关系 ${stats.relations}` +
+    (stats.notes ? ` · 笔记 ${stats.notes} · 双链 ${stats.links}（未解析 ${stats.unresolved}）` : "") +
+    (q ? ` · 筛选"${escapeHtml(q)}"` : "");
   if (!data.nodes.length) {
     graphChart.clear();
     graphChart.setOption({
@@ -763,6 +893,38 @@ async function refreshGraph(q = "") {
 $("#graph-refresh").addEventListener("click", () => refreshGraph($("#graph-search").value.trim()));
 $("#graph-search").addEventListener("keydown", (e) => {
   if (e.key === "Enter") refreshGraph(e.target.value.trim());
+});
+
+// 图解读：展示「AI 实际读到的图」——实体档案、多跳路径与社群，
+// 用于调参和解释「为什么回答里会提到某条间接关系」。
+$("#graph-read-btn").addEventListener("click", async () => {
+  const out = $("#graph-read-out");
+  const q = $("#graph-read-q").value.trim();
+  const kbq = currentKbId != null ? "&kb_id=" + currentKbId : "";
+  out.style.display = "block";
+  out.textContent = "解读中…";
+  try {
+    const r = await api(`/api/graph/read?q=${encodeURIComponent(q)}${kbq}`);
+    out.textContent = r.narrative || "暂无图谱结构可解读（可先上传文档并构建图谱）";
+  } catch (e) {
+    out.textContent = "解读失败：" + e.message;
+  }
+});
+$("#graph-read-q").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("#graph-read-btn").click();
+});
+
+// 重建双链：批量导入笔记后手动补挂反链接（上传流程已自动触发，这里给个显式入口）
+$("#graph-relink").addEventListener("click", async () => {
+  const r = await api("/api/notes/relink", {
+    method: "POST",
+    body: JSON.stringify({ kb_id: currentKbId }),
+  });
+  await refreshGraph($("#graph-search").value.trim());
+  $("#graph-read-out").style.display = "block";
+  $("#graph-read-out").textContent =
+    `双链重建完成：新解析 ${r.resolved} 条，图谱边 ${r.edges} 条，` +
+    `共 ${r.stats.notes} 篇笔记 / ${r.stats.links} 条链接（未解析 ${r.stats.unresolved}）`;
 });
 
 async function openEntity(entityId) {
@@ -1033,6 +1195,12 @@ async function runDebug() {
     });
     if (r.error) throw new Error(r.error);
     let html = "";
+    if (r.graph_narrative) {
+      html += `<div style="margin-bottom:10px"><span class="rp-title">图谱解读</span><div style="white-space:pre-wrap;font-size:12px;line-height:1.75;color:var(--text-2);margin-top:6px">${escapeHtml(r.graph_narrative)}</div></div>`;
+    }
+    if (r.notes) {
+      html += `<div style="margin-bottom:10px"><span class="rp-title">笔记链接</span><div style="white-space:pre-wrap;font-size:12px;line-height:1.75;color:var(--text-2);margin-top:6px">${escapeHtml(r.notes)}</div></div>`;
+    }
     if (r.graph_entities && r.graph_entities.length) {
       html += `<div style="margin-bottom:8px"><span class="rp-title">命中实体</span> ` + r.graph_entities.map((e) => `<span class="tag">${escapeHtml(e)}</span>`).join("") + `</div>`;
     }
@@ -1075,7 +1243,8 @@ async function loadKbStatus() {
     const docs = await api("/api/documents" + kbq);
     const stats = await api("/api/graph/stats" + kbq);
     const ready = docs.filter((d) => d.status === "done").length;
-    $("#kb-status").textContent = `知识库「${kbNameOf(currentKbId)}」：${ready}/${docs.length} 份文档就绪 · 图谱 ${stats.entities} 实体/${stats.relations} 关系`;
+    $("#kb-status").textContent = `知识库「${kbNameOf(currentKbId)}」：${ready}/${docs.length} 份文档就绪 · 图谱 ${stats.entities} 实体/${stats.relations} 关系` +
+      (stats.notes ? ` · ${stats.notes} 篇笔记/${stats.links} 条双链` : "");
   } catch (e) {}
 }
 
@@ -1097,8 +1266,13 @@ $("#chat-input").addEventListener("input", function () {
   } catch (e) {
     toast("加载知识库失败：" + e.message, false);
   }
-  loadChatList();
   loadKbStatus();
-  loadOcrTip();
+  // 会话列表 / OCR 提示不是首屏必需内容，延到主线程空闲再取，
+  // 避免启动阶段与首帧渲染挤在一起形成长任务
+  const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 120));
+  idle(() => {
+    loadChatList();
+    loadOcrTip();
+  });
   setInterval(loadKbStatus, 8000);
 })();

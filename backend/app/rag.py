@@ -1,9 +1,11 @@
-"""RAG 编排：检索（向量/图谱/混合/联网）→ 重排 → 带引用的流式生成。"""
+"""RAG 编排：检索（向量/图谱/图谱解读/混合/联网）→ 重排 → 带引用的流式生成。"""
 import asyncio
 import json
 import re
 import time
 from . import db
+from . import notes as note_mod
+from . import graph_context as gc
 from .config import get_settings
 from .providers import llm_chat, rerank, ProviderError, estimate_tokens, estimate_messages_tokens
 from .vectorstore import vector_search
@@ -13,10 +15,14 @@ SYSTEM_PROMPT = """你是「知识库问答助手」，必须严格依据下面�
 
 要求：
 1. 优先使用参考资料中的信息；在句末用 [编号] 标注引用来源，如：……属于核心模块 [2]
-2. 参考资料中包含知识图谱三元组（形式为 A --关系--> B），它们是文档中抽取的事实，可用于推理和补充
-3. 参考资料中可能包含联网搜索结果（会标注网页地址），请综合使用并注意信息时效性
-4. 若参考资料不足以回答，请明确说明"参考资料中暂无相关信息"，不要编造
-5. 用简体中文回答，结构清晰；涉及多个要点时使用列表
+2. 参考资料中可能包含「知识图谱解读」：实体档案、多跳关系路径与概念社群。
+   请沿路径做多跳推理，推断性结论要写明推理链（如：据 A→B→C 可推知），
+   并与原文直述区分开，不要编造图中不存在的边
+3. 参考资料中可能包含「反向链接」：其他笔记引用本笔记的语境。可据此说明该知识点
+   在知识网络中的位置与相互影响
+4. 参考资料中可能包含联网搜索结果（会标注网页地址），请综合使用并注意信息时效性
+5. 若参考资料不足以回答，请明确说明"参考资料中暂无相关信息"，不要编造
+6. 用简体中文回答，结构清晰；涉及多个要点时使用列表
 """
 
 WEB_SYSTEM_PROMPT = """你是「联网问答助手」。请严格依据下面提供的联网搜索结果回答用户问题。
@@ -215,10 +221,11 @@ def _new_usage() -> dict:
 
 async def retrieve(query: str, mode_override: str = None, kb_id: int = None, web: bool = False):
     """检索 + 可选重排。返回 (chunks, graph_ctx, aux_usage, web_ctx)。
-    模式：vector 纯向量 / graph 纯图谱 / hybrid 混合（RRF 融合）/
-          insights 图谱洞察（社群+中心性分析）/ natural 纯模型（不检索）/
-          web 仅联网搜索（由「纯模型问答 + 联网搜索」组合进入）。
+    模式：vector 纯向量 / graph 纯图谱 / graph_read 图谱解读（实体卡片+路径+社群）/
+          hybrid 混合（RRF 融合）/ insights 图谱洞察（社群+中心性分析）/
+          natural 纯模型（不检索）/ web 仅联网搜索（由「纯模型问答 + 联网搜索」组合进入）。
     指定 kb_id 时仅在该知识库范围内检索；web=True 时额外抓取网页结果并追加到 chunks。
+    graph_ctx 额外携带 narrative（图谱自然语言解读）与 notes（笔记反链接上下文）。
     """
     cfg = get_settings()
     rcfg = cfg.get("retrieval", {})
@@ -226,7 +233,7 @@ async def retrieve(query: str, mode_override: str = None, kb_id: int = None, web
     top_k = int(rcfg.get("top_k", 6))
     hops = int(rcfg.get("graph_hops", 2))
 
-    graph_ctx = {"triples": [], "entities": []}
+    graph_ctx = {"triples": [], "entities": [], "narrative": "", "notes": "", "paths": []}
     web_ctx = {"enabled": bool(web), "count": 0, "error": "", "query": ""}
     aux = _new_usage()
     if mode == "natural" and not web:
@@ -242,23 +249,50 @@ async def retrieve(query: str, mode_override: str = None, kb_id: int = None, web
     elif mode == "graph":
         g = await kg.graph_search(query, hops=hops, top_k=top_k, kb_id=kb_id)
         _add_usage(aux, g.get("usage"))
-        graph_ctx = {"triples": g["triples"], "entities": g["entities"]}
+        graph_ctx = {
+            "triples": g["triples"], "entities": g["entities"],
+            "narrative": gc.render_subgraph_brief(
+                g.get("edges") or [], g.get("node_ids") or [], kb_id
+            ),
+            "paths": [], "notes": "",
+        }
         chunks = g["chunks"]
+    elif mode == "graph_read":
+        # 图谱解读：向量兜底 + 子图叙述化。只做一次实体链接（在 read_graph 内部）
+        vec_hits, _, u = await vector_search(query, top_k=top_k, kb_id=kb_id)
+        _add_usage(aux, u)
+        g = await gc.read_graph(query, kb_id=kb_id, hops=hops, max_chunks=top_k + 2)
+        _add_usage(aux, g.get("usage"))
+        graph_ctx = {
+            "triples": g["triples"], "entities": g["entities"],
+            "narrative": g.get("narrative") or "",
+            "paths": g.get("paths") or [], "notes": "",
+        }
+        chunks = _rrf_merge([vec_hits, g.get("chunks") or []])[: top_k + 2]
     elif mode == "insights":
         g = await kg.graph_insights(query, hops=hops, top_k=top_k, kb_id=kb_id)
         _add_usage(aux, g.get("usage"))
-        graph_ctx = {"triples": g["triples"], "entities": g["entities"]}
+        graph_ctx = {
+            "triples": g["triples"], "entities": g["entities"],
+            "narrative": "", "paths": [], "notes": "",
+        }
         chunks = g["chunks"]
     else:
         vec_hits, _, u = await vector_search(query, top_k=top_k, kb_id=kb_id)
         _add_usage(aux, u)
         g = await kg.graph_search(query, hops=hops, top_k=top_k, kb_id=kb_id)
         _add_usage(aux, g.get("usage"))
-        graph_ctx = {"triples": g["triples"], "entities": g["entities"]}
+        graph_ctx = {
+            "triples": g["triples"], "entities": g["entities"],
+            "narrative": gc.render_subgraph_brief(
+                g.get("edges") or [], g.get("node_ids") or [], kb_id
+            ),
+            "paths": [], "notes": "",
+        }
         chunks = _rrf_merge([vec_hits, g["chunks"]])[: top_k + 3]
 
     # 在线图谱补全：为图谱上下文补充 LLM 推理出的隐含关系
-    if cfg.get("graph", {}).get("completion") and mode in ("graph", "hybrid", "insights"):
+    if cfg.get("graph", {}).get("completion") and mode in ("graph", "graph_read", "hybrid", "insights"):
         inferred, u = await kg.complete_subgraph(query, graph_ctx["triples"])
         _add_usage(aux, u)
         if inferred:
@@ -309,12 +343,24 @@ async def retrieve(query: str, mode_override: str = None, kb_id: int = None, web
             web_ctx["count"] = len(web_chunks)
         except Exception as e:  # 网络不可用/被限流时降级为仅知识库回答
             web_ctx["error"] = (str(e).strip() or type(e).__name__)[:200]
+
+    # Obsidian 反链接：命中的笔记要带上「谁引用了它、它链接到谁」，
+    # 让模型理解知识点在知识网络中的位置，而不是孤立段落。
+    if mode != "web":
+        graph_ctx["notes"] = note_mod.context_for_chunks(chunks, kb_id)
     return chunks, graph_ctx, aux, web_ctx
 
 
 def build_context(chunks, graph_ctx, max_chars=6000):
-    """构建带编号的参考资料上下文。"""
+    """构建带编号的参考资料上下文。
+
+    顺序即优先级：图谱解读在最前（模型先读到结构化事实，多跳推理更稳），
+    其次是带编号的原文分块（引用编号与前端一一对应），最后是三元组与笔记反链接。
+    """
     parts = []
+    narrative = (graph_ctx or {}).get("narrative") or ""
+    if narrative:
+        parts.append(narrative[:1800])
     used = 0
     for i, c in enumerate(chunks, 1):
         is_web = c.get("source") == "web"
@@ -331,6 +377,8 @@ def build_context(chunks, graph_ctx, max_chars=6000):
     if graph_ctx.get("triples"):
         trip = "\n".join(f"- {t}" for t in graph_ctx["triples"][:40])
         ctx += f"\n\n【知识图谱三元组（文档中抽取的事实）】\n{trip}"
+    if (graph_ctx or {}).get("notes"):
+        ctx += "\n\n" + graph_ctx["notes"][:2000]
     return ctx
 
 
@@ -410,6 +458,9 @@ async def answer_stream_events(query: str, history: list, mode_override: str = N
                 "refs": [],
                 "graph_entities": [],
                 "graph_triples": [],
+                "graph_narrative": "",
+                "graph_paths": [],
+                "notes": "",
                 "search_query": None,
             },
         }
@@ -461,12 +512,15 @@ async def answer_stream_events(query: str, history: list, mode_override: str = N
             "refs": refs,
             "graph_entities": graph_ctx.get("entities", []),
             "graph_triples": graph_ctx.get("triples", [])[:20],
+            "graph_narrative": (graph_ctx.get("narrative") or "")[:1600],
+            "graph_paths": [p.get("text") for p in (graph_ctx.get("paths") or [])][:6],
+            "notes": (graph_ctx.get("notes") or "")[:1200],
             "search_query": search_query if search_query != query else None,
             "web": web_ctx,
         },
     }
 
-    if not chunks and not graph_ctx.get("triples"):
+    if not chunks and not graph_ctx.get("triples") and not graph_ctx.get("narrative"):
         if web:
             msg = "知识库与联网搜索均未获取到有效结果"
             if web_ctx.get("error"):

@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>知识库问答 · RAG + 知识图谱</title>
+<!-- 内联 favicon：避免每次访问都打出一个 404（控制台噪音 + 无谓请求） -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2310141c'/%3E%3Ccircle cx='11' cy='10' r='3.4' fill='%234f8cff'/%3E%3Ccircle cx='22' cy='14' r='2.6' fill='%233dd68c'/%3E%3Ccircle cx='14' cy='23' r='2.6' fill='%23e7c25f'/%3E%3Cpath d='M11 10 22 14 14 23 11 10' stroke='%232e3950' stroke-width='1.4' fill='none'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -61,6 +63,7 @@
           <label>检索模式</label>
           <select id="chat-mode">
             <option value="hybrid">混合（向量+图谱）</option>
+            <option value="graph_read">图谱解读（AI 读图，更全面）</option>
             <option value="vector">向量检索</option>
             <option value="graph">知识图谱</option>
             <option value="insights">图谱洞察（社群/中心性）</option>
@@ -111,6 +114,7 @@
           <div class="kb-actions">
             <button class="small" id="btn-new-kb" title="新建一个知识库">＋ 新建</button>
             <button class="small" id="btn-rename-kb" title="重命名当前知识库">✎ 重命名</button>
+            <button class="small" id="btn-notes" title="补解析存量 Markdown 笔记并重建双链（升级前上传的文档也能补齐）">笔记双链</button>
             <button class="small danger" id="btn-del-kb" title="删除当前知识库及其全部文档">删除</button>
           </div>
         </div>
@@ -119,7 +123,7 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></svg>
             拖拽文件到此处，或点击选择上传
           </div>
-          <div>上传到当前知识库：<b id="upload-kb-name">—</b>。支持 PDF / Word(.docx) / Markdown / TXT / 图片(PNG/JPG)，可多选，上传后自动分块、向量化<span id="upload-graph-tip">、构建知识图谱</span></div>
+          <div>上传到当前知识库：<b id="upload-kb-name">—</b>。支持 PDF / Word(.docx) / Markdown / TXT / 图片(PNG/JPG)，可多选，上传后自动分块、向量化<span id="upload-graph-tip">、构建知识图谱</span>。Obsidian 笔记会自动解析 <code>[[双链]]</code>、标签与 frontmatter，生成反链接（也支持 <code>[文本](笔记.md)</code>；升级前上传的 Markdown 点右上「笔记双链」补解析）</div>
           <div class="uz-tip" id="ocr-upload-tip"></div>
         </div>
         <input type="file" id="file-input" multiple accept=".pdf,.docx,.md,.markdown,.txt,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff" style="display:none">
@@ -129,6 +133,12 @@
           </tr></thead>
           <tbody id="docs-tbody"></tbody>
         </table>
+        <div class="entity-panel note-panel" id="note-panel">
+          <div class="ename" id="note-panel-title"></div>
+          <div class="type" id="note-panel-meta"></div>
+          <div id="note-panel-body"></div>
+          <div style="margin-top:10px;text-align:right"><button class="small" id="note-panel-close">关闭</button></div>
+        </div>
         <div class="empty" id="docs-empty">
           <div class="eicon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></div>
           <div class="etitle">还没有文档</div>
@@ -149,6 +159,12 @@
         <div class="graph-tools">
           <input id="graph-search" placeholder="搜索实体，回车过滤子图…">
           <button class="small" id="graph-refresh">刷新</button>
+          <button class="small" id="graph-relink" title="重新解析笔记双链并刷新图谱边">重建双链</button>
+        </div>
+        <div class="graph-read-box">
+          <input id="graph-read-q" placeholder="可选：输入问题，查看 AI 实际读到的图谱结构">
+          <button class="small" id="graph-read-btn">图解读</button>
+          <div id="graph-read-out"></div>
         </div>
         <div class="graph-stats" id="graph-stats"></div>
         <div class="entity-panel" id="entity-panel">
@@ -247,6 +263,7 @@
               <div class="field"><label>默认检索模式</label>
                 <select id="cfg-mode">
                   <option value="hybrid">混合（向量+图谱，推荐）</option>
+                  <option value="graph_read">图谱解读（AI 读图，更全面）</option>
                   <option value="vector">向量检索</option>
                   <option value="graph">知识图谱</option>
                   <option value="insights">图谱洞察（社群/中心性）</option>
@@ -301,7 +318,7 @@
   </div>
 </div>
 
-<script src="/static/echarts.min.js"></script>
-<script src="/static/app.js"></script>
+<!-- echarts（约 1MB）按需加载：仅在首次进入「知识图谱」视图时由 app.js 动态注入 -->
+<script src="/static/app.js" defer></script>
 </body>
 </html>

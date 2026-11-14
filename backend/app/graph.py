@@ -270,7 +270,8 @@ async def graph_search(query: str, hops: int = 2, top_k: int = 8, kb_id: int = N
     """
     ents, link_usage = await link_entities(query, kb_id=kb_id)
     if not ents:
-        return {"chunks": [], "triples": [], "entities": [], "usage": link_usage}
+        return {"chunks": [], "triples": [], "entities": [], "edges": [], "node_ids": [],
+                "usage": link_usage}
 
     conn = db.get_conn()
     kb_doc_sub = "(SELECT id FROM documents WHERE kb_id=?)"
@@ -278,6 +279,7 @@ async def graph_search(query: str, hops: int = 2, top_k: int = 8, kb_id: int = N
     visited = set(frontier.keys())
     chunk_score = {}   # chunk_id -> score
     triples = []
+    edges = []         # 结构化边，供「图谱可读化」渲染自然语言叙述
     ent_names = {e["name"] for e in ents}
 
     # 实体名缓存：同一实体在多跳扩展里会被反复取名称，避免逐条 N+1 查询
@@ -296,19 +298,24 @@ async def graph_search(query: str, hops: int = 2, top_k: int = 8, kb_id: int = N
         ids = tuple(frontier.keys())
         if kb_id is None:
             rows = conn.execute(
-                f"SELECT head_id, tail_id, relation, chunk_id FROM relations "
+                f"SELECT head_id, tail_id, relation, chunk_id, kind FROM relations "
                 f"WHERE head_id IN ({marks}) OR tail_id IN ({marks}) LIMIT 400",
                 ids + ids,
             ).fetchall()
         else:
             rows = conn.execute(
-                f"SELECT head_id, tail_id, relation, chunk_id FROM relations "
+                f"SELECT head_id, tail_id, relation, chunk_id, kind FROM relations "
                 f"WHERE (head_id IN ({marks}) OR tail_id IN ({marks})) "
                 f"AND doc_id IN {kb_doc_sub} LIMIT 400",
                 ids + ids + (kb_id,),
             ).fetchall()
         next_frontier = {}
         for r in rows:
+            edges.append({
+                "head_id": r["head_id"], "tail_id": r["tail_id"],
+                "relation": r["relation"], "chunk_id": r["chunk_id"],
+                "kind": r["kind"] if "kind" in r.keys() else "extracted",
+            })
             for eid in (r["head_id"], r["tail_id"]):
                 if eid not in visited:
                     row = conn.execute("SELECT id,name,type FROM entities WHERE id=?", (eid,)).fetchone()
@@ -346,7 +353,8 @@ async def graph_search(query: str, hops: int = 2, top_k: int = 8, kb_id: int = N
                 chunk_score[r["id"]] = chunk_score.get(r["id"], 0.0) + 0.6
 
     if not chunk_score:
-        return {"chunks": [], "triples": triples, "entities": sorted(ent_names), "usage": link_usage}
+        return {"chunks": [], "triples": triples, "entities": sorted(ent_names),
+                "edges": edges, "node_ids": sorted(visited), "usage": link_usage}
 
     ranked = sorted(chunk_score.items(), key=lambda x: -x[1])[:top_k]
     marks = ",".join("?" * len(ranked))
@@ -359,7 +367,8 @@ async def graph_search(query: str, hops: int = 2, top_k: int = 8, kb_id: int = N
         r = row_map.get(cid)
         if r:
             chunks.append({"chunk_id": cid, "doc_id": r["doc_id"], "text": r["text"], "score": float(sc)})
-    return {"chunks": chunks, "triples": triples, "entities": sorted(ent_names), "usage": link_usage}
+    return {"chunks": chunks, "triples": triples, "entities": sorted(ent_names),
+            "edges": edges, "node_ids": sorted(visited), "usage": link_usage}
 
 
 # ---------------- 图谱补全（graph completion） ----------------

@@ -1,7 +1,11 @@
 """模型服务客户端：统一走 OpenAI 兼容协议（线上免费 API / 本地 Ollama / 自定义）。"""
+import asyncio
 import json
 import re
+import weakref
+
 import httpx
+
 from .config import get_settings
 
 TIMEOUT = httpx.Timeout(120.0, connect=15.0)
@@ -9,6 +13,34 @@ TIMEOUT = httpx.Timeout(120.0, connect=15.0)
 
 class ProviderError(Exception):
     pass
+
+
+# ---------------- 共享 HTTP 连接池 ----------------
+# 每次 LLM/embedding 调用新建 AsyncClient 意味着重复 TCP/TLS 握手，
+# 真实网络下单次多耗 50-150ms，chat 一次问答要发起 2-4 个模型请求，全链路放大。
+# 这里按事件循环缓存共享 client（uvicorn 常驻单循环 → 整个生命周期复用），
+# 超时改为 per-request 传入，因为不同接口的合理超时不同（OCR 300s / LLM 120s）。
+_HTTP_CLIENTS = {}  # id(loop) -> (AsyncClient, weakref.ref(loop))
+
+
+def shared_http_client() -> httpx.AsyncClient:
+    """返回与当前事件循环绑定的共享 AsyncClient；默认超时为 None，须按请求传入 timeout。"""
+    loop = asyncio.get_running_loop()
+    entry = _HTTP_CLIENTS.get(id(loop))
+    if entry:
+        client, loop_ref = entry
+        if loop_ref() is not None and not client.is_closed:
+            return client
+        _HTTP_CLIENTS.pop(id(loop), None)  # 循环已销毁，连接池随之失效
+    client = httpx.AsyncClient(
+        timeout=None,
+        limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+    )
+    _HTTP_CLIENTS[id(loop)] = (client, weakref.ref(loop))
+    if len(_HTTP_CLIENTS) > 8:  # 测试等场景反复换循环时，清理已失效条目
+        for k in [k for k, (_c, lr) in _HTTP_CLIENTS.items() if lr() is None]:
+            _HTTP_CLIENTS.pop(k, None)
+    return client
 
 
 _ENDPOINT_TAILS = ("/chat/completions", "/embeddings", "/rerank", "/completions")
@@ -105,11 +137,11 @@ async def llm_chat(messages, stream=False, temperature=None, max_tokens=2048, se
     try:
         if stream:
             return _stream_sse(url, key, payload)
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            r = await client.post(url, headers=_headers(key), json=payload)
-            if r.status_code != 200:
-                raise ProviderError(f"LLM HTTP {r.status_code}: {r.text[:300]}")
-            data = r.json()
+        client = shared_http_client()
+        r = await client.post(url, headers=_headers(key), json=payload, timeout=TIMEOUT)
+        if r.status_code != 200:
+            raise ProviderError(f"LLM HTTP {r.status_code}: {r.text[:300]}")
+        data = r.json()
         choices = data.get("choices") or []
         if not choices:
             raise ProviderError(f"LLM 返回异常（无 choices）：{str(data)[:200]}")
@@ -131,30 +163,31 @@ async def _stream_sse(url, key, payload):
     消费方拿不到时自行按字符估算。
     """
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            async with client.stream("POST", url, headers=_headers(key), json=payload) as r:
-                if r.status_code != 200:
-                    body = await r.aread()
-                    raise ProviderError(f"LLM HTTP {r.status_code}: {body.decode('utf-8', 'ignore')[:300]}")
-                async for line in r.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        obj = json.loads(data)
-                    except Exception:
-                        continue
-                    piece, usage = "", None
-                    choices = obj.get("choices") or []
-                    if choices:
-                        delta = choices[0].get("delta") or {}
-                        piece = delta.get("content") or ""
-                    if obj.get("usage") is not None:
-                        usage = _norm_usage(obj.get("usage"))
-                    if piece or usage:
-                        yield piece, usage
+        client = shared_http_client()
+        async with client.stream("POST", url, headers=_headers(key), json=payload,
+                                 timeout=TIMEOUT) as r:
+            if r.status_code != 200:
+                body = await r.aread()
+                raise ProviderError(f"LLM HTTP {r.status_code}: {body.decode('utf-8', 'ignore')[:300]}")
+            async for line in r.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+                piece, usage = "", None
+                choices = obj.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    piece = delta.get("content") or ""
+                if obj.get("usage") is not None:
+                    usage = _norm_usage(obj.get("usage"))
+                if piece or usage:
+                    yield piece, usage
     except httpx.HTTPError as e:
         raise ProviderError(f"LLM 流式网络错误：{e}") from e
 
@@ -199,25 +232,26 @@ async def embed_texts(texts: list, return_usage: bool = False):
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "estimated": False}
     got_usage = False
     batch = 16
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        for i in range(0, len(texts), batch):
-            part = texts[i : i + batch]
-            payload = {"model": conf["model"], "input": part}
-            try:
-                r = await client.post(
-                    f"{conf['base_url']}/embeddings", headers=_headers(conf["api_key"]), json=payload
-                )
-            except httpx.HTTPError as e:
-                raise ProviderError(f"Embedding 网络错误：{e}") from e
-            if r.status_code != 200:
-                raise ProviderError(f"Embedding HTTP {r.status_code}: {r.text[:300]}")
-            data = r.json()
-            out.extend(d["embedding"] for d in data["data"])
-            u = _norm_usage(data.get("usage"))
-            if u:
-                got_usage = True
-                usage["prompt_tokens"] += u["prompt_tokens"]
-                usage["total_tokens"] += u["total_tokens"]
+    client = shared_http_client()
+    for i in range(0, len(texts), batch):
+        part = texts[i : i + batch]
+        payload = {"model": conf["model"], "input": part}
+        try:
+            r = await client.post(
+                f"{conf['base_url']}/embeddings", headers=_headers(conf["api_key"]), json=payload,
+                timeout=TIMEOUT,
+            )
+        except httpx.HTTPError as e:
+            raise ProviderError(f"Embedding 网络错误：{e}") from e
+        if r.status_code != 200:
+            raise ProviderError(f"Embedding HTTP {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        out.extend(d["embedding"] for d in data["data"])
+        u = _norm_usage(data.get("usage"))
+        if u:
+            got_usage = True
+            usage["prompt_tokens"] += u["prompt_tokens"]
+            usage["total_tokens"] += u["total_tokens"]
     if not got_usage:
         t = sum(estimate_tokens(x) for x in texts)
         usage = {"prompt_tokens": t, "completion_tokens": 0, "total_tokens": t, "estimated": True}
@@ -239,10 +273,11 @@ async def rerank(query: str, texts: list, top_k: int = None):
         "return_documents": False,
     }
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            r = await client.post(
-                f"{conf['base_url']}/rerank", headers=_headers(conf["api_key"]), json=payload
-            )
+        client = shared_http_client()
+        r = await client.post(
+            f"{conf['base_url']}/rerank", headers=_headers(conf["api_key"]), json=payload,
+            timeout=TIMEOUT,
+        )
     except httpx.HTTPError as e:
         raise ProviderError(f"Rerank 网络错误：{e}") from e
     if r.status_code != 200:
@@ -322,22 +357,23 @@ async def _ocr_openai(url: str, key: str, payload: dict, retries: int) -> str:
     import asyncio
 
     r = None
-    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=15.0)) as client:
-        for attempt in range(retries + 1):
-            try:
-                r = await client.post(url, headers=_headers(key), json=payload)
-            except httpx.HTTPError as e:
-                if attempt < retries:
-                    await asyncio.sleep(1.5 * (attempt + 1))
-                    continue
-                raise ProviderError(f"OCR 网络错误：{e}") from e
-            if r.status_code == 200:
-                break
-            # 5xx / 429 属于上游抖动，可重试
-            if (r.status_code >= 500 or r.status_code == 429) and attempt < retries:
+    client = shared_http_client()
+    for attempt in range(retries + 1):
+        try:
+            r = await client.post(url, headers=_headers(key), json=payload,
+                                  timeout=httpx.Timeout(180.0, connect=15.0))
+        except httpx.HTTPError as e:
+            if attempt < retries:
                 await asyncio.sleep(1.5 * (attempt + 1))
                 continue
-            raise ProviderError(f"OCR HTTP {r.status_code}: {r.text[:300]}")
+            raise ProviderError(f"OCR 网络错误：{e}") from e
+        if r.status_code == 200:
+            break
+        # 5xx / 429 属于上游抖动，可重试
+        if (r.status_code >= 500 or r.status_code == 429) and attempt < retries:
+            await asyncio.sleep(1.5 * (attempt + 1))
+            continue
+        raise ProviderError(f"OCR HTTP {r.status_code}: {r.text[:300]}")
     if r is None or r.status_code != 200:
         raise ProviderError(f"OCR HTTP {getattr(r, 'status_code', '?')}: {getattr(r, 'text', '')[:300]}")
     try:
@@ -369,8 +405,9 @@ async def _ocr_ollama_native(base_url: str, model: str, image: bytes, prompt: st
         "options": {"temperature": 0, "num_predict": max_tokens},
     }
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0)) as client:
-            r = await client.post(f"{root}/api/generate", json=payload)
+        client = shared_http_client()
+        r = await client.post(f"{root}/api/generate", json=payload,
+                              timeout=httpx.Timeout(300.0, connect=15.0))
     except httpx.HTTPError as e:
         raise ProviderError(f"Ollama 原生接口网络错误：{e}") from e
     if r.status_code != 200:
